@@ -20,5 +20,5 @@ pydantic
 pydantic-settings
 
 python-dotenv
-
+python-multipart
 requests
