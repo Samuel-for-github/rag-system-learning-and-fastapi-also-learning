@@ -110,11 +110,11 @@ class AdvancedRAGPipeline:
             f"[{i + 1}] {src['source']} (page {src['page']})"
             for i, src in enumerate(sources)
         ]
-        answer_with_citations = (
-            answer + "\n\nCitations:\n" + "\n".join(citations)
-            if citations
-            else answer
-        )
+        # answer_with_citations = (
+        #     answer + "\n\nCitations:\n" + "\n".join(citations)
+        #     if citations
+        #     else answer
+        # )
 
         summary = None
         if summarize and answer:
@@ -128,7 +128,7 @@ class AdvancedRAGPipeline:
 
         return {
             "question": question,
-            "answer": answer_with_citations,
+            "answer": answer,
             "sources": sources,
             "summary": summary,
             "history": self.history,
