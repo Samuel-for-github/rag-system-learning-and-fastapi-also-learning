@@ -85,7 +85,7 @@ embedding_manager = EmbeddingManager()
 class VectorStore:
     """Manages document embeddings in a ChromaDB vector store"""
 
-    def __init__(self, collection_name: str = "pdf_documents", persist_directory: str = "data/vector_store"):
+    def __init__(self, collection_name: str = "pdf_documents"):
         """
         Initialize the vector store
 
@@ -94,7 +94,7 @@ class VectorStore:
             persist_directory: Directory to persist the vector store
         """
         self.collection_name = collection_name
-        self.persist_directory = persist_directory
+
         self.client = None
         self.collection = None
         self._initialize_store()
@@ -103,7 +103,7 @@ class VectorStore:
         """Initialize ChromaDB client and collection"""
         try:
             # Create persistent ChromaDB client
-            os.makedirs(self.persist_directory, exist_ok=True)
+            # os.makedirs(self.persist_directory, exist_ok=True)
             # self.client = chromadb.PersistentClient(path=self.persist_directory)
             self.client = chromadb.CloudClient(
                 api_key=os.getenv("CHROMA_API_KEY"),
