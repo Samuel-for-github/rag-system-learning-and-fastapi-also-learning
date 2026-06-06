@@ -18,7 +18,7 @@ scikit-learn
 
 pydantic
 pydantic-settings
-
+langchain_openrouter
 python-dotenv
 python-multipart
 requests
