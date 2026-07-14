@@ -23,3 +23,4 @@ langchain_openrouter
 python-dotenv
 python-multipart
 requests
+pandas

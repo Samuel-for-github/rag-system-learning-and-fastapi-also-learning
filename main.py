@@ -4,11 +4,13 @@ import tempfile
 from typing import List, Dict, Any
 import time
 import numpy as np
+import pandas as pd
 import chromadb
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from pydantic import BaseModel
 from dotenv import load_dotenv
-from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.document_loaders import PyPDFLoader, CSVLoader
+from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.messages import HumanMessage
 from sentence_transformers import SentenceTransformer
@@ -25,10 +27,13 @@ if not openrouter_api_key:
 
 llm = ChatOpenRouter(
     api_key=openrouter_api_key,
-    model="liquid/lfm-2.5-1.2b-instruct:free",
+    model="nvidia/nemotron-3-ultra-550b-a55b:free",
     temperature=0.1,
     max_tokens=1000,
 )
+
+# File types this API can ingest
+SUPPORTED_EXTENSIONS = {".pdf", ".csv", ".xlsx", ".xls"}
 
 
 # ==========================================================
@@ -196,9 +201,10 @@ class AdvancedRAGPipeline:
             context = ""
         else:
             context = "\n\n".join([doc['content'] for doc in results])
+            print(context)
             sources = [{
                 'source': doc['metadata'].get('source_file', doc['metadata'].get('source', 'unknown')),
-                'page': doc['metadata'].get('page', 'unknown'),
+                'page': doc['metadata'].get('page', doc['metadata'].get('row', 'unknown')),
                 'score': doc['similarity_score'],
                 'preview': doc['content'][:120] + '...'
             } for doc in results]
@@ -326,11 +332,86 @@ rag_pipeline = AdvancedRAGPipeline(rag_retriever,llm)
 
 
 # ==========================================================
-# PDF PROCESSING
+# FILE LOADING (PDF / CSV / XLSX)
 # ==========================================================
 
-def split_documents(documents,chunk_size=10000,chunk_overlap=200):
-    """Split documents into smaller chunks for better RAG performance"""
+def load_pdf(path: str, filename: str) -> List[Document]:
+    """Load a PDF file into LangChain Documents (one per page)."""
+    loader = PyPDFLoader(path)
+    docs = loader.load()
+    for doc in docs:
+        doc.metadata["source_file"] = filename
+        doc.metadata["file_type"] = "pdf"
+    return docs
+
+
+def load_csv(path: str, filename: str) -> List[Document]:
+    """Load a CSV file into LangChain Documents (one per row)."""
+    loader = CSVLoader(file_path=path)
+    docs = loader.load()
+    for i, doc in enumerate(docs):
+        doc.metadata["source_file"] = filename
+        doc.metadata["file_type"] = "csv"
+        doc.metadata["row"] = i
+    return docs
+
+
+def load_excel(path: str, filename: str) -> List[Document]:
+    """
+    Load an Excel workbook into LangChain Documents.
+    Every sheet is read, and each row becomes its own Document so that
+    retrieval can point back to a specific sheet/row.
+    """
+    docs: List[Document] = []
+    try:
+        sheets = pd.read_excel(path, sheet_name=None, engine="openpyxl")
+    except Exception as e:
+        raise ValueError(f"Failed to read Excel file '{filename}': {e}")
+
+    for sheet_name, df in sheets.items():
+        if df.empty:
+            continue
+        df = df.fillna("")
+        columns = [str(c) for c in df.columns]
+
+        for row_idx, row in df.iterrows():
+            row_text = "\n".join(f"{col}: {row[col]}" for col in columns)
+            content = f"Sheet: {sheet_name}\n{row_text}"
+            metadata = {
+                "source_file": filename,
+                "file_type": "xlsx",
+                "sheet": sheet_name,
+                "row": int(row_idx),
+            }
+            docs.append(Document(page_content=content, metadata=metadata))
+
+    return docs
+
+
+def load_file(path: str, filename: str) -> List[Document]:
+    """Dispatch to the correct loader based on file extension."""
+    ext = os.path.splitext(filename)[1].lower()
+
+    if ext == ".pdf":
+        return load_pdf(path, filename)
+    elif ext == ".csv":
+        return load_csv(path, filename)
+    elif ext in (".xlsx", ".xls"):
+        return load_excel(path, filename)
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type '{ext}'. Allowed types: {sorted(SUPPORTED_EXTENSIONS)}"
+        )
+
+
+def split_documents(documents, chunk_size=10000, chunk_overlap=200):
+    """Split documents into smaller chunks for better RAG performance.
+
+    Row-based documents (CSV/XLSX) are already small, so this is mainly
+    relevant for PDF text, but it's safe to run on all document types —
+    anything under chunk_size passes through untouched.
+    """
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
@@ -375,42 +456,39 @@ def health():
 
 
 @app.post("/upload")
-async def upload_pdf(file: UploadFile = File(...)):
-    if not file.filename.endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDF files allowed")
+async def upload_file(file: UploadFile = File(...)):
+    ext = os.path.splitext(file.filename)[1].lower()
+    if ext not in SUPPORTED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type '{ext}'. Allowed types: {sorted(SUPPORTED_EXTENSIONS)}"
+        )
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
         tmp.write(await file.read())
-        pdf_path = tmp.name
+        file_path = tmp.name
 
     try:
-        loader = PyPDFLoader(pdf_path)
-        docs = loader.load()
+        docs = load_file(file_path, file.filename)
+
+        if not docs:
+            raise HTTPException(status_code=400, detail="No content could be extracted from the file")
+
         chunks = split_documents(docs)
 
         texts = [chunk.page_content for chunk in chunks]
         embeddings = embedding_manager.generate_embeddings(texts)
 
-        ids = []
-        metadatas = []
-        for chunk in chunks:
-            ids.append(str(uuid.uuid4()))
-            metadata = dict(chunk.metadata)
-            metadata["source_file"] = file.filename
-            metadatas.append(metadata)
-
         vectorstore.add_documents(chunks, embeddings)
-        # collection.add(
-        #     ids=ids,
-        #     embeddings=embeddings,
-        #     documents=texts,
-        #     metadatas=metadatas,
-        # )
 
-        return {"message": "PDF indexed successfully", "chunks": len(texts)}
+        return {
+            "message": f"{ext.lstrip('.').upper()} file indexed successfully",
+            "filename": file.filename,
+            "chunks": len(texts),
+        }
 
     finally:
-        os.remove(pdf_path)
+        os.remove(file_path)
 
 
 @app.post("/query")
