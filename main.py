@@ -14,7 +14,7 @@ from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.messages import HumanMessage
 from sentence_transformers import SentenceTransformer
-
+from charset_normalizer import from_path
 load_dotenv()
 
 app = FastAPI(title="RAG API")
@@ -119,7 +119,10 @@ class VectorStore:
             # Get or create collection
             self.collection = self.client.get_or_create_collection(
                 name=self.collection_name,
-                metadata={"description": "PDF document embeddings for RAG"}
+                metadata={
+                    "description": "PDF document embeddings for RAG",
+                    "hnsw:space": "cosine"
+                }
             )
             print(f"Vector store initialized. Collection: {self.collection_name}")
             print(f"Existing documents in collection: {self.collection.count()}")
@@ -291,6 +294,7 @@ class RAGRetriever:
             )
 
             # Process results
+
             retrieved_docs = []
 
             if results['documents'] and results['documents'][0]:
@@ -304,6 +308,7 @@ class RAGRetriever:
                     similarity_score = 1 - distance
 
                     if similarity_score >= score_threshold:
+                        # print(f"distance={distance}, similarity_score={similarity_score}")
                         retrieved_docs.append({
                             'id': doc_id,
                             'content': document,
@@ -347,8 +352,20 @@ def load_pdf(path: str, filename: str) -> List[Document]:
 
 def load_csv(path: str, filename: str) -> List[Document]:
     """Load a CSV file into LangChain Documents (one per row)."""
-    loader = CSVLoader(file_path=path)
-    docs = loader.load()
+    # Detect the file's actual encoding instead of relying on the
+    # OS default (cp1252 on Windows), which breaks on non-ASCII bytes.
+    detected = from_path(path).best()
+    encoding = detected.encoding if detected else "utf-8"
+
+    try:
+        loader = CSVLoader(file_path=path, encoding=encoding)
+        docs = loader.load()
+    except UnicodeDecodeError:
+        # Last-resort fallback: latin-1 maps every byte 0-255,
+        # so it will never raise, even if it's not a perfect guess.
+        loader = CSVLoader(file_path=path, encoding="latin-1")
+        docs = loader.load()
+
     for i, doc in enumerate(docs):
         doc.metadata["source_file"] = filename
         doc.metadata["file_type"] = "csv"
