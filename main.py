@@ -12,9 +12,10 @@ from dotenv import load_dotenv
 from langchain_community.document_loaders import PyPDFLoader, CSVLoader
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_core.messages import HumanMessage
-from sentence_transformers import SentenceTransformer
+# from langchain_core.messages import HumanMessage
+# from sentence_transformers import SentenceTransformer
 from charset_normalizer import from_path
+import requests
 load_dotenv()
 
 app = FastAPI(title="RAG API")
@@ -41,32 +42,20 @@ SUPPORTED_EXTENSIONS = {".pdf", ".csv", ".xlsx", ".xls"}
 # ==========================================================
 
 class EmbeddingManager:
-    """Handles document embedding generation using SentenceTransformer"""
+    """Handles document embedding generation via the Hugging Face Inference API
+    (no local model loaded — keeps the deployment lightweight)."""
 
-    def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
-        """
-        Initialize the embedding manager
-
-        Args:
-            model_name: HuggingFace model name for sentence embeddings
-        """
+    def __init__(self, model_name: str = "sentence-transformers/all-MiniLM-L6-v2"):
         self.model_name = model_name
-        self.model = None
-        self._load_model()
-
-    def _load_model(self):
-        """Load the SentenceTransformer model"""
-        try:
-            print(f"Loading embedding model: {self.model_name}")
-            self.model = SentenceTransformer(self.model_name)
-            print(f"Model loaded successfully. Embedding dimension: {self.model.get_embedding_dimension()}")
-        except Exception as e:
-            print(f"Error loading model {self.model_name}: {e}")
-            raise
+        self.api_url = f"https://router.huggingface.co/hf-inference/models/{model_name}/pipeline/feature-extraction"
+        self.hf_token = os.getenv("HF_API_TOKEN")
+        if not self.hf_token:
+            raise ValueError("HF_API_TOKEN environment variable is not set")
+        self.headers = {"Authorization": f"Bearer {self.hf_token}"}
 
     def generate_embeddings(self, texts: List[str]) -> np.ndarray:
         """
-        Generate embeddings for a list of texts
+        Generate embeddings for a list of texts via HF's hosted inference API.
 
         Args:
             texts: List of text strings to embed
@@ -74,15 +63,23 @@ class EmbeddingManager:
         Returns:
             numpy array of embeddings with shape (len(texts), embedding_dim)
         """
-        if not self.model:
-            raise ValueError("Model not loaded")
+        print(f"Generating embeddings for {len(texts)} texts via HF Inference API...")
 
-        print(f"Generating embeddings for {len(texts)} texts...")
-        embeddings = self.model.encode(texts, show_progress_bar=True)
+        response = requests.post(
+            self.api_url,
+            headers=self.headers,
+            json={"inputs": texts, "options": {"wait_for_model": True}},
+            timeout=60,
+        )
+
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"HF Inference API error {response.status_code}: {response.text}"
+            )
+
+        embeddings = np.array(response.json())
         print(f"Generated embeddings with shape: {embeddings.shape}")
         return embeddings
-
-
 embedding_manager = EmbeddingManager()
 # ==========================================================
 # VECTOR STORE
