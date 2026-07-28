@@ -26,6 +26,7 @@ from fastapi.middleware.cors import CORSMiddleware
 origins = [
     "http://localhost:3000",  # Next.js
     "http://127.0.0.1:3000",
+    "https://rag-project-frontend-indol.vercel.app"
     # Add your production frontend URL here later
 ]
 
