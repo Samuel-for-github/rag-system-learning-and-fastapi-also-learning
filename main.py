@@ -5,7 +5,7 @@ from typing import List, Dict, Any
 import time
 import numpy as np
 import pandas as pd
-import chromadb
+from pinecone import Pinecone, ServerlessSpec
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -51,6 +51,15 @@ llm = ChatOpenRouter(
 
 # File types this API can ingest
 SUPPORTED_EXTENSIONS = {".pdf", ".csv", ".xlsx", ".xls"}
+
+# The embedding dimension for sentence-transformers/all-MiniLM-L6-v2.
+# Pinecone needs this up front to create the index.
+EMBEDDING_DIMENSION = 384
+
+# Pinecone has a hard 40KB metadata-per-vector limit, and the document text
+# has to live in metadata (there's no separate "documents" field like Chroma).
+# Truncate stored text defensively so a single huge chunk can't blow the limit.
+MAX_METADATA_TEXT_CHARS = 30000
 
 
 # ==========================================================
@@ -101,48 +110,62 @@ embedding_manager = EmbeddingManager()
 # VECTOR STORE
 # ==========================================================
 class VectorStore:
-    """Manages document embeddings in a ChromaDB vector store"""
+    """Manages document embeddings in a Pinecone vector store"""
 
-    def __init__(self, collection_name: str = "pdf_documents"):
+    def __init__(self, index_name: str = "appbuddy"):
         """
         Initialize the vector store
 
         Args:
-            collection_name: Name of the ChromaDB collection
-            persist_directory: Directory to persist the vector store
+            index_name: Name of the Pinecone index. Pinecone index names must
+                be lowercase alphanumeric + hyphens only (no underscores).
         """
-        self.collection_name = collection_name
+        self.index_name = index_name
 
         self.client = None
-        self.collection = None
+        self.index = None
         self._initialize_store()
 
     def _initialize_store(self):
-        """Initialize ChromaDB client and collection"""
+        """Initialize Pinecone client and index"""
         try:
-            # Create persistent ChromaDB client
-            # os.makedirs(self.persist_directory, exist_ok=True)
-            # self.client = chromadb.PersistentClient(path=self.persist_directory)
-            self.client = chromadb.CloudClient(
-                api_key=os.getenv("CHROMA_API_KEY"),
-                tenant=os.getenv("CHROMA_TENANT"),
-                database=os.getenv("CHROMA_DATABASE"),
-)
+            api_key = os.getenv("PINECONE_API_KEY")
+            if not api_key:
+                raise ValueError("PINECONE_API_KEY environment variable is not set")
 
-            # Get or create collection
-            self.collection = self.client.get_or_create_collection(
-                name=self.collection_name,
-                metadata={
-                    "description": "PDF document embeddings for RAG",
-                    "hnsw:space": "cosine"
-                }
-            )
-            print(f"Vector store initialized. Collection: {self.collection_name}")
-            print(f"Existing documents in collection: {self.collection.count()}")
+            self.client = Pinecone(api_key=api_key)
+
+            existing_indexes = [idx["name"] for idx in self.client.list_indexes()]
+
+            if self.index_name not in existing_indexes:
+                print(f"Index '{self.index_name}' not found, creating it...")
+                self.client.create_index(
+                    name=self.index_name,
+                    dimension=EMBEDDING_DIMENSION,
+                    metric="cosine",
+                    spec=ServerlessSpec(
+                        cloud=os.getenv("PINECONE_CLOUD", "aws"),
+                        region=os.getenv("PINECONE_REGION", "us-east-1"),
+                    ),
+                )
+                # Wait for the index to be ready before using it
+                while not self.client.describe_index(self.index_name).status["ready"]:
+                    time.sleep(1)
+
+            self.index = self.client.Index(self.index_name)
+
+            print(f"Vector store initialized. Index: {self.index_name}")
+            stats = self.index.describe_index_stats()
+            print(f"Existing vectors in index: {stats.get('total_vector_count', 0)}")
 
         except Exception as e:
             print(f"Error initializing vector store: {e}")
             raise
+
+    def count(self) -> int:
+        """Return the current number of vectors stored in the index."""
+        stats = self.index.describe_index_stats()
+        return stats.get("total_vector_count", 0)
 
     def add_documents(self, documents: List[Any], embeddings: np.ndarray):
         """
@@ -157,39 +180,40 @@ class VectorStore:
 
         print(f"Adding {len(documents)} documents to vector store...")
 
-        # Prepare data for ChromaDB
-        ids = []
-        metadatas = []
-        documents_text = []
-        embeddings_list = []
+        vectors = []
 
         for i, (doc, embedding) in enumerate(zip(documents, embeddings)):
             # Generate unique ID
             doc_id = f"doc_{uuid.uuid4().hex[:8]}_{i}"
-            ids.append(doc_id)
 
-            # Prepare metadata
-            metadata = dict(doc.metadata)
-            metadata['doc_index'] = i
-            metadata['content_length'] = len(doc.page_content)
-            metadatas.append(metadata)
+            # Prepare metadata. Pinecone metadata values must be strings,
+            # numbers, booleans, or lists of strings — no nested dicts.
+            metadata = {
+                str(k): v for k, v in doc.metadata.items()
+                if isinstance(v, (str, int, float, bool))
+            }
+            metadata["doc_index"] = i
+            metadata["content_length"] = len(doc.page_content)
+            # Pinecone has no separate "documents" store, so the text itself
+            # has to be carried in metadata to be retrievable later.
+            metadata["text"] = doc.page_content[:MAX_METADATA_TEXT_CHARS]
 
-            # Document content
-            documents_text.append(doc.page_content)
+            vectors.append({
+                "id": doc_id,
+                "values": embedding.tolist(),
+                "metadata": metadata,
+            })
 
-            # Embedding
-            embeddings_list.append(embedding.tolist())
-
-        # Add to collection
+        # Add to index. Pinecone recommends batching upserts (~100 per batch)
+        # to stay comfortably under request size limits.
         try:
-            self.collection.add(
-                ids=ids,
-                embeddings=embeddings_list,
-                metadatas=metadatas,
-                documents=documents_text
-            )
+            batch_size = 100
+            for start in range(0, len(vectors), batch_size):
+                batch = vectors[start:start + batch_size]
+                self.index.upsert(vectors=batch)
+
             print(f"Successfully added {len(documents)} documents to vector store")
-            print(f"Total documents in collection: {self.collection.count()}")
+            print(f"Total vectors in index: {self.count()}")
 
         except Exception as e:
             print(f"Error adding documents to vector store: {e}")
@@ -301,33 +325,32 @@ class RAGRetriever:
 
         # Search in vector store
         try:
-            results = self.vector_store.collection.query(
-                query_embeddings=[query_embedding.tolist()],
-                n_results=top_k
+            results = self.vector_store.index.query(
+                vector=query_embedding.tolist(),
+                top_k=top_k,
+                include_metadata=True,
             )
 
             # Process results
-
             retrieved_docs = []
 
-            if results['documents'] and results['documents'][0]:
-                documents = results['documents'][0]
-                metadatas = results['metadatas'][0]
-                distances = results['distances'][0]
-                ids = results['ids'][0]
+            matches = results.get("matches", [])
 
-                for i, (doc_id, document, metadata, distance) in enumerate(zip(ids, documents, metadatas, distances)):
-                    # Convert distance to similarity score (ChromaDB uses cosine distance)
-                    similarity_score = 1 - distance
+            if matches:
+                for i, match in enumerate(matches):
+                    metadata = dict(match.get("metadata", {}))
+                    # Pinecone returns cosine *similarity* directly as `score`
+                    # (unlike Chroma, which returns distance), so no 1 - x needed.
+                    similarity_score = match.get("score", 0.0)
+                    document_text = metadata.pop("text", "")
 
                     if similarity_score >= score_threshold:
-                        # print(f"distance={distance}, similarity_score={similarity_score}")
                         retrieved_docs.append({
-                            'id': doc_id,
-                            'content': document,
+                            'id': match.get("id"),
+                            'content': document_text,
                             'metadata': metadata,
                             'similarity_score': similarity_score,
-                            'distance': distance,
+                            'distance': 1 - similarity_score,
                             'rank': i + 1
                         })
 
@@ -343,9 +366,7 @@ class RAGRetriever:
 
 rag_retriever=RAGRetriever(vectorstore,embedding_manager)
 
-# collection = client.get_or_create_collection(name="pdf_documents")
-
-# Wire up the pipeline now that collection is ready
+# Wire up the pipeline now that the index is ready
 rag_pipeline = AdvancedRAGPipeline(rag_retriever,llm)
 
 
@@ -482,7 +503,7 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"status": "healthy", "documents":vectorstore.collection.count()}
+    return {"status": "healthy", "documents": vectorstore.count()}
 
 
 @app.post("/upload")
@@ -523,7 +544,7 @@ async def upload_file(file: UploadFile = File(...)):
 
 @app.post("/query")
 def query_documents(request: QueryRequest):
-    # FIX: route through the RAG pipeline instead of hitting ChromaDB directly
+    # FIX: route through the RAG pipeline instead of hitting Pinecone directly
     return rag_pipeline.query(
         question=request.query,
         top_k=request.top_k,
