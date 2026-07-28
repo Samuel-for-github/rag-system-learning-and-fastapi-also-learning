@@ -19,7 +19,23 @@ import requests
 load_dotenv()
 
 app = FastAPI(title="RAG API")
+from fastapi.middleware.cors import CORSMiddleware
 
+
+
+origins = [
+    "http://localhost:3000",  # Next.js
+    "http://127.0.0.1:3000",
+    # Add your production frontend URL here later
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,      # or ["*"] for testing
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 from langchain_openrouter import ChatOpenRouter
 
 openrouter_api_key = os.getenv("OPENROUTER_API_KEY")
