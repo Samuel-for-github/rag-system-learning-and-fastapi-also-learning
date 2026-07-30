@@ -1,7 +1,7 @@
 import os
 import uuid
 import tempfile
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import time
 import numpy as np
 import pandas as pd
@@ -233,36 +233,80 @@ class AdvancedRAGPipeline:
         self.llm = llm
         self.history = []  # Store query history
 
-    def query(self, question: str, top_k: int = 5, min_score: float = 0.2, stream: bool = False, summarize: bool = False) -> Dict[str, Any]:
+    def query(
+        self,
+        question: str,
+        top_k: int = 3,
+        min_score: float = 0.4,
+        stream: bool = False,
+        summarize: bool = False,
+        metadata_filter: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         # Retrieve relevant documents
-        results = self.retriever.retrieve(question, top_k=top_k, score_threshold=min_score)
+        results = self.retriever.retrieve(
+            question,
+            top_k=top_k,
+            score_threshold=min_score,
+            metadata_filter=metadata_filter,
+        )
+
+        # FIX: debug visibility into exactly what's being handed to the LLM,
+        # so it's obvious when weak/irrelevant chunks are the real cause of a
+        # bad answer rather than the prompt itself.
+        print(f"\n--- Retrieved {len(results)} chunk(s) passed to the LLM ---")
+        for doc in results:
+            print(f"  score={doc['similarity_score']:.4f} source={doc['metadata'].get('source_file', 'unknown')}")
+            print(f"  preview: {doc['content'][:150]!r}")
+        print("--- end retrieved chunks ---\n")
+
         if not results:
-            answer = "No relevant context found."
+            answer = "I don't have information about this in the provided documents."
             sources = []
             context = ""
         else:
             context = "\n\n".join([doc['content'] for doc in results])
-            print(context)
             sources = [{
                 'source': doc['metadata'].get('source_file', doc['metadata'].get('source', 'unknown')),
                 'page': doc['metadata'].get('page', doc['metadata'].get('row', 'unknown')),
                 'score': doc['similarity_score'],
                 'preview': doc['content'][:120] + '...'
             } for doc in results]
-            # Streaming answer simulation
-            prompt = f"""Use the following context to answer the question concisely.\nContext:\n{context}\n\nQuestion: {question}\n\nAnswer:"""
+
+            # FIX: strict grounding prompt — the old version only *suggested*
+            # using the context, which left the LLM free to blend in outside
+            # knowledge or invent details not actually retrieved.
+            prompt = f"""You are a document assistant that answers questions using ONLY the context provided below.
+
+Rules:
+- Use ONLY the information in the context to answer. Do NOT use outside knowledge, even if you know the answer.
+- Do NOT guess, infer, or add details that are not explicitly present in the context.
+- If the context does not contain enough information to answer, respond exactly with:
+  "I don't have information about this in the provided documents."
+- Keep the answer concise and grounded strictly in the context.
+
+Context:
+{context}
+
+Question: {question}
+
+Answer:"""
+
             if stream:
                 print("Streaming answer:")
                 for i in range(0, len(prompt), 80):
                     print(prompt[i:i+80], end='', flush=True)
                     time.sleep(0.05)
                 print()
-            response = self.llm.invoke([prompt.format(context=context, question=question)])
+
+            # FIX: previously this called prompt.format(context=context, question=question)
+            # on a string that was already an f-string with those values filled in.
+            # If any retrieved chunk contained a literal "{" or "}" (JSON, notes, etc.),
+            # that second .format() call would raise or silently corrupt the prompt.
+            response = self.llm.invoke([prompt])
             answer = response.content
 
         # Add citations to answer
         citations = [f"[{i+1}] {src['source']} (page {src['page']})" for i, src in enumerate(sources)]
-        # answer_with_citations = answer + "\n\nCitations:\n" + "\n".join(citations) if citations else answer
 
         # Optionally summarize answer
         summary = None
@@ -283,6 +327,7 @@ class AdvancedRAGPipeline:
             'question': question,
             'answer': answer,
             'sources': sources,
+            'citations': citations,
             'summary': summary,
             'history': self.history
         }
@@ -306,7 +351,13 @@ class RAGRetriever:
         self.vector_store = vector_store
         self.embedding_manager = embedding_manager
 
-    def retrieve(self, query: str, top_k: int = 5, score_threshold: float = 0.0) -> List[Dict[str, Any]]:
+    def retrieve(
+        self,
+        query: str,
+        top_k: int = 3,
+        score_threshold: float = 0.4,
+        metadata_filter: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
         """
         Retrieve relevant documents for a query
 
@@ -314,23 +365,33 @@ class RAGRetriever:
             query: The search query
             top_k: Number of top results to return
             score_threshold: Minimum similarity score threshold
+            metadata_filter: Optional Pinecone metadata filter, e.g.
+                {"taluka": "Tiswadi"} or {"source_file": "goa_places.csv"} —
+                lets a caller scope retrieval to a subset of ingested docs
+                instead of always searching the whole index.
 
         Returns:
             List of dictionaries containing retrieved documents and metadata
         """
         print(f"Retrieving documents for query: '{query}'")
-        print(f"Top K: {top_k}, Score threshold: {score_threshold}")
+        print(f"Top K: {top_k}, Score threshold: {score_threshold}, Filter: {metadata_filter}")
 
         # Generate query embedding
         query_embedding = self.embedding_manager.generate_embeddings([query])[0]
 
         # Search in vector store
         try:
-            results = self.vector_store.index.query(
-                vector=query_embedding.tolist(),
-                top_k=top_k,
-                include_metadata=True,
-            )
+            query_kwargs = {
+                "vector": query_embedding.tolist(),
+                "top_k": top_k,
+                "include_metadata": True,
+            }
+            # FIX: only attach a filter when one is actually supplied, so
+            # existing callers that don't care about scoping are unaffected.
+            if metadata_filter:
+                query_kwargs["filter"] = metadata_filter
+
+            results = self.vector_store.index.query(**query_kwargs)
 
             # Process results
             retrieved_docs = []
@@ -457,7 +518,13 @@ def load_file(path: str, filename: str) -> List[Document]:
         )
 
 
-def split_documents(documents, chunk_size=10000, chunk_overlap=200):
+# FIX: chunk_size dropped from 10000 -> 800 (chars). At 10k chars a single
+# chunk could span multiple unrelated topics (beaches + hotels + temples in
+# one blob), which drags irrelevant text into every retrieval that happens
+# to match any part of it. 800/100 keeps each chunk topically tight while
+# still giving RecursiveCharacterTextSplitter enough room to break on
+# paragraph/sentence boundaries first.
+def split_documents(documents, chunk_size=800, chunk_overlap=100):
     """Split documents into smaller chunks for better RAG performance.
 
     Row-based documents (CSV/XLSX) are already small, so this is mainly
@@ -488,9 +555,17 @@ def split_documents(documents, chunk_size=10000, chunk_overlap=200):
 
 class QueryRequest(BaseModel):
     query: str
-    top_k: int = 5
-    min_score: float = 0.2
+    top_k: int = 3
+    # FIX: raised from 0.2 -> 0.4. 0.2 cosine similarity is close to
+    # "barely related" for MiniLM embeddings and let near-irrelevant chunks
+    # into the context window. Tune this per your embedding model/data if
+    # 0.4 is too strict or too loose for your corpus.
+    min_score: float = 0.4
     summarize: bool = False
+    # FIX: generic metadata filter (e.g. {"taluka": "Tiswadi"},
+    # {"source_file": "goa_places.csv"}) so a query can be scoped to a
+    # subset of the index instead of always searching everything.
+    filter: Optional[Dict[str, Any]] = None
 
 
 # ==========================================================
@@ -545,10 +620,11 @@ async def upload_file(file: UploadFile = File(...)):
 
 @app.post("/query")
 def query_documents(request: QueryRequest):
-    # FIX: route through the RAG pipeline instead of hitting Pinecone directly
+    # Route through the RAG pipeline instead of hitting Pinecone directly
     return rag_pipeline.query(
         question=request.query,
         top_k=request.top_k,
         min_score=request.min_score,
         summarize=request.summarize,
+        metadata_filter=request.filter,
     )
