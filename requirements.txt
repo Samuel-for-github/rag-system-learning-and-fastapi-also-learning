@@ -18,7 +18,10 @@ charset-normalizer
  
 pydantic
 pydantic-settings
+
 langchain_openrouter
+langchain-google-genai
+
 python-dotenv
 python-multipart
 requests
