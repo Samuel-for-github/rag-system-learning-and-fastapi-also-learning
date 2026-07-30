@@ -18,7 +18,6 @@ from charset_normalizer import from_path
 import requests
 load_dotenv()
 
-from langchain_google_genai import ChatGoogleGenerativeAI
 app = FastAPI(title="RAG API")
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -44,9 +43,9 @@ openrouter_api_key = os.getenv("OPENROUTER_API_KEY")
 if not openrouter_api_key:
     raise ValueError("OPENROUTER_API_KEY environment variable is not set")
 
-llm = ChatGoogleGenerativeAI(
-    api_key="AIzaSyBWd-M8phgN-Lw2RTQBemz_MfyOwmj_g00",
-    model="gemini-3.5-flash-lite",
+llm = ChatOpenRouter(
+    api_key=openrouter_api_key,
+    model="nvidia/nemotron-3-ultra-550b-a55b:free",
     temperature=0.1,
     max_tokens=1000,
 )
