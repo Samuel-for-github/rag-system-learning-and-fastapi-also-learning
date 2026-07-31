@@ -38,17 +38,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 from langchain_openrouter import ChatOpenRouter
+from langchain_huggingface import HuggingFaceEndpoint, ChatHuggingFace
 
 openrouter_api_key = os.getenv("OPENROUTER_API_KEY")
 if not openrouter_api_key:
     raise ValueError("OPENROUTER_API_KEY environment variable is not set")
 
-llm = ChatOpenRouter(
-    api_key=openrouter_api_key,
-    model="nvidia/nemotron-3-ultra-550b-a55b:free",
-    temperature=0.1,
-    max_tokens=1000,
+
+endpoint = HuggingFaceEndpoint(
+    repo_id="Qwen/Qwen2.5-7B-Instruct",
+    task="text-generation",
+    max_new_tokens=512,
+    temperature=0.2,
+    huggingfacehub_api_token=os.getenv("HF_API_TOKEN"),
 )
+
+
+llm = ChatHuggingFace(llm=endpoint)
 
 # File types this API can ingest
 SUPPORTED_EXTENSIONS = {".pdf", ".csv", ".xlsx", ".xls"}

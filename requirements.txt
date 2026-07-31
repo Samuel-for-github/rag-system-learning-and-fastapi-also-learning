@@ -20,7 +20,7 @@ pydantic
 pydantic-settings
 
 langchain_openrouter
-
+langchain-huggingface
 
 python-dotenv
 python-multipart
