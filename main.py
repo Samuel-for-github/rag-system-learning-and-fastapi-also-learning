@@ -46,7 +46,7 @@ if not openrouter_api_key:
 
 
 endpoint = HuggingFaceEndpoint(
-    repo_id="Qwen/Qwen2.5-7B-Instruct",
+    repo_id="Qwen/Qwen2.5-72B-Instruct",
     task="text-generation",
     max_new_tokens=512,
     temperature=0.2,
