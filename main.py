@@ -1,7 +1,9 @@
 import os
+import re
 import uuid
 import tempfile
 from typing import List, Dict, Any, Optional
+from collections import defaultdict
 import time
 import numpy as np
 import pandas as pd
@@ -9,7 +11,7 @@ from pinecone import Pinecone, ServerlessSpec
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from pydantic import BaseModel
 from dotenv import load_dotenv
-from langchain_community.document_loaders import PyPDFLoader, CSVLoader
+from langchain_community.document_loaders import PyPDFLoader
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 # from langchain_core.messages import HumanMessage
@@ -40,9 +42,9 @@ app.add_middleware(
 from langchain_openrouter import ChatOpenRouter
 from langchain_huggingface import HuggingFaceEndpoint, ChatHuggingFace
 
-openrouter_api_key = os.getenv("OPENROUTER_API_KEY")
-if not openrouter_api_key:
-    raise ValueError("OPENROUTER_API_KEY environment variable is not set")
+# openrouter_api_key = os.getenv("OPENROUTER_API_KEY")
+# if not openrouter_api_key:
+#     raise ValueError("OPENROUTER_API_KEY environment variable is not set")
 
 
 endpoint = HuggingFaceEndpoint(
@@ -67,6 +69,100 @@ EMBEDDING_DIMENSION = 384
 # has to live in metadata (there's no separate "documents" field like Chroma).
 # Truncate stored text defensively so a single huge chunk can't blow the limit.
 MAX_METADATA_TEXT_CHARS = 30000
+
+# Pinecone metadata values must be strings, numbers, or booleans (no nested
+# dicts/lists of non-strings). Cap how long a string metadata value can be so
+# one huge cell (e.g. a giant "description" column) can't blow the 40KB
+# per-vector metadata limit on its own.
+MAX_METADATA_FIELD_CHARS = 500
+
+# Goa's 12 talukas — a fixed, known list, so matching against it directly is
+# far more reliable than trying to generically extract a "location" from
+# free text. Used to auto-detect a taluka mentioned in a user's question and
+# scope retrieval to it without the caller having to build a filter by hand.
+GOA_TALUKAS = [
+    "tiswadi", "bardez", "salcete", "mormugao", "ponda", "bicholim",
+    "sanguem", "quepem", "canacona", "pernem", "sattari", "dharbandora",
+]
+
+
+def detect_taluka_filter(text: str) -> Optional[str]:
+    """
+    Look for a known Goa taluka name mentioned in free text (e.g. a user's
+    question) and return it if found. Matches whole words only, case
+    insensitive, so e.g. "ponda" won't false-positive inside an unrelated
+    longer word. Returns the taluka lowercased (matching how it's stored in
+    metadata) or None if no taluka is mentioned.
+    """
+    lowered = text.lower()
+    for taluka in GOA_TALUKAS:
+        if re.search(rf"\b{re.escape(taluka)}\b", lowered):
+            return taluka
+    return None
+
+
+# Field name -> set of distinct (lowercased) values seen during ingestion.
+# Populated automatically for "categorical" columns — see
+# _register_categorical_columns — so a question's free text can be matched
+# against real values from *your* dataset (category, sub_category, ...)
+# instead of a hand-maintained list per field. Resets on process restart;
+# it gets rebuilt as files are re-ingested via /upload.
+FIELD_VALUE_REGISTRY: Dict[str, set] = defaultdict(set)
+
+# Structural/bookkeeping fields that should never be auto-matched against —
+# they aren't things a person would type into a question.
+FIELD_REGISTRY_EXCLUDE = {
+    "source_file", "file_type", "row", "sheet", "doc_index", "content_length",
+}
+
+
+def _register_categorical_columns(df: "pd.DataFrame", columns: List[str]) -> None:
+    """
+    Inspect a freshly-loaded CSV/Excel dataframe and record distinct values
+    for any column that looks categorical (few unique values relative to
+    row count) into FIELD_VALUE_REGISTRY.
+
+    Heuristic: a column counts as categorical if it has at most 50 distinct
+    non-empty values AND those values cover at most 20% of the row count —
+    e.g. 12 talukas or ~15 categories across hundreds of rows qualifies;
+    "place_name" or "description", which are close to unique per row,
+    don't. This keeps the registry small and avoids matching on noisy,
+    effectively-unique text.
+    """
+    n_rows = len(df)
+    if n_rows == 0:
+        return
+    for col in columns:
+        key = str(col).strip().lower().replace(" ", "_")
+        if not key or key in FIELD_REGISTRY_EXCLUDE:
+            continue
+        series = df[col].astype(str).str.strip()
+        series = series[series != ""]
+        if series.empty:
+            continue
+        nunique = series.nunique()
+        if nunique <= 50 and (nunique / n_rows) <= 0.2:
+            for val in series.unique():
+                FIELD_VALUE_REGISTRY[key].add(val.lower())
+
+
+def detect_filters_from_text(text: str) -> Dict[str, str]:
+    """
+    Scan free text (e.g. a user's question) for values matching any
+    registered categorical field (built from actually-ingested data — see
+    _register_categorical_columns) and return a filter dict for whichever
+    fields matched. Within a field, longer values are checked first so a
+    more specific phrase (e.g. "beach / coastal") wins over a shorter one
+    that happens to be a substring of it.
+    """
+    lowered = text.lower()
+    detected: Dict[str, str] = {}
+    for field, values in FIELD_VALUE_REGISTRY.items():
+        for val in sorted(values, key=len, reverse=True):
+            if re.search(rf"\b{re.escape(val)}\b", lowered):
+                detected[field] = val
+                break
+    return detected
 
 
 # ==========================================================
@@ -195,6 +291,9 @@ class VectorStore:
 
             # Prepare metadata. Pinecone metadata values must be strings,
             # numbers, booleans, or lists of strings — no nested dicts.
+            # doc.metadata already carries filterable fields like
+            # "location"/"category" (see load_csv/load_excel below), so this
+            # just needs to pass scalars through as-is.
             metadata = {
                 str(k): v for k, v in doc.metadata.items()
                 if isinstance(v, (str, int, float, bool))
@@ -356,6 +455,7 @@ class RAGRetriever:
         """
         self.vector_store = vector_store
         self.embedding_manager = embedding_manager
+        self._dummy_vector_cache: Optional[List[float]] = None
 
     def retrieve(
         self,
@@ -372,13 +472,20 @@ class RAGRetriever:
             top_k: Number of top results to return
             score_threshold: Minimum similarity score threshold
             metadata_filter: Optional Pinecone metadata filter, e.g.
-                {"taluka": "Tiswadi"} or {"source_file": "goa_places.csv"} —
+                {"location": "Sanguem"} or {"source_file": "goa_places.csv"} —
                 lets a caller scope retrieval to a subset of ingested docs
-                instead of always searching the whole index.
+                instead of always searching the whole index. Combine with
+                Pinecone operators for more control, e.g.
+                {"location": {"$eq": "Sanguem"}}.
 
         Returns:
             List of dictionaries containing retrieved documents and metadata
         """
+        # Filter values are matched literally by Pinecone, and ingestion
+        # stores them lowercased (see _row_metadata), so normalize whatever
+        # casing the caller/LLM produced before it ever reaches Pinecone.
+        metadata_filter = normalize_metadata_filter(metadata_filter)
+
         print(f"Retrieving documents for query: '{query}'")
         print(f"Top K: {top_k}, Score threshold: {score_threshold}, Filter: {metadata_filter}")
 
@@ -432,6 +539,60 @@ class RAGRetriever:
             print(f"Error during retrieval: {e}")
             return []
 
+    def list_by_filter(
+        self,
+        metadata_filter: Dict[str, Any],
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """
+        Return documents that match a metadata filter, ignoring semantic
+        similarity entirely.
+
+        Pinecone always ranks by vector distance, even when a filter is
+        supplied — there's no native "just give me everything where
+        location = Sanguem" call. The workaround is to query with a neutral
+        (zero) vector and a large top_k: the filter still narrows the
+        candidate set correctly, we just don't care about the resulting
+        (meaningless) similarity ordering.
+
+        Args:
+            metadata_filter: Required Pinecone metadata filter, e.g.
+                {"location": "Sanguem"}.
+            limit: Max number of matches to return (Pinecone allows up to
+                10,000 per query).
+        """
+        if not metadata_filter:
+            raise ValueError("metadata_filter is required for list_by_filter")
+
+        metadata_filter = normalize_metadata_filter(metadata_filter)
+
+        # FIX: an all-zero vector has undefined cosine similarity, and some
+        # Pinecone index configurations return zero matches for it even
+        # when the metadata filter alone would match plenty of rows. Use a
+        # real (cached) embedding instead — the filter still does 100% of
+        # the actual scoping; this vector only affects the meaningless
+        # ordering of results within that filtered set.
+        if self._dummy_vector_cache is None:
+            self._dummy_vector_cache = self.embedding_manager.generate_embeddings([" "])[0].tolist()
+
+        results = self.vector_store.index.query(
+            vector=self._dummy_vector_cache,
+            top_k=min(limit, 10000),
+            filter=metadata_filter,
+            include_metadata=True,
+        )
+
+        docs = []
+        for match in results.get("matches", []):
+            metadata = dict(match.get("metadata", {}))
+            document_text = metadata.pop("text", "")
+            docs.append({
+                'id': match.get("id"),
+                'content': document_text,
+                'metadata': metadata,
+            })
+        return docs
+
 rag_retriever=RAGRetriever(vectorstore,embedding_manager)
 
 # Wire up the pipeline now that the index is ready
@@ -441,6 +602,67 @@ rag_pipeline = AdvancedRAGPipeline(rag_retriever,llm)
 # ==========================================================
 # FILE LOADING (PDF / CSV / XLSX)
 # ==========================================================
+
+def _row_metadata(row: pd.Series, columns: List[str]) -> Dict[str, Any]:
+    """
+    Turn every column in a CSV/Excel row into filterable Pinecone metadata.
+
+    Column names are normalized ("Location" -> "location") so filters like
+    {"location": "Sanguem"} work regardless of the source file's exact header
+    casing/spacing. Only scalar values are kept (Pinecone metadata can't hold
+    nested structures), empty cells are skipped, and long strings are capped
+    so one oversized column can't blow the per-vector metadata limit.
+    """
+    metadata: Dict[str, Any] = {}
+    for col in columns:
+        key = str(col).strip().lower().replace(" ", "_")
+        if not key:
+            continue
+        val = row[col]
+        if val is None or val == "":
+            continue
+        if isinstance(val, str):
+            val = val.strip()
+            if not val:
+                continue
+            if len(val) > MAX_METADATA_FIELD_CHARS:
+                val = val[:MAX_METADATA_FIELD_CHARS]
+            # Lowercase so filtering is case-insensitive: Pinecone's $eq is a
+            # literal string match, so "Sanguem"/"sanguem"/"SANGUEM" would
+            # otherwise be three different filter values. The original
+            # casing is still readable in page_content/row_text — only the
+            # metadata copy used for filtering is lowercased.
+            val = val.lower()
+        elif not isinstance(val, (int, float, bool)):
+            # Skip anything that isn't a plain scalar (e.g. lists, dicts,
+            # Timestamps) rather than risk an upsert error.
+            continue
+        metadata[key] = val
+    return metadata
+
+
+def normalize_metadata_filter(metadata_filter: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """
+    Lowercase every string value inside a metadata filter (recursing into
+    Pinecone operator dicts like {"$eq": "Sanguem"} and lists like
+    {"$in": ["Sanguem", "Tiswadi"]}), so a filter built from a user's raw
+    question ("Sanguem", "SANGUEM", "sanguem ") matches the lowercased
+    values stored by _row_metadata. Field *names* (dict keys) are left
+    alone — only the values are touched.
+    """
+    def _normalize(value: Any) -> Any:
+        if isinstance(value, str):
+            return value.strip().lower()
+        if isinstance(value, list):
+            return [_normalize(v) for v in value]
+        if isinstance(value, dict):
+            return {k: _normalize(v) for k, v in value.items()}
+        return value
+
+    if not metadata_filter:
+        return metadata_filter
+    return {k: _normalize(v) for k, v in metadata_filter.items()}
+
 
 def load_pdf(path: str, filename: str) -> List[Document]:
     """Load a PDF file into LangChain Documents (one per page)."""
@@ -453,25 +675,41 @@ def load_pdf(path: str, filename: str) -> List[Document]:
 
 
 def load_csv(path: str, filename: str) -> List[Document]:
-    """Load a CSV file into LangChain Documents (one per row)."""
+    """
+    Load a CSV file into LangChain Documents (one per row).
+
+    Every column (e.g. "location", "category", "name") is promoted to its
+    own metadata field via _row_metadata, so ingested rows can later be
+    scoped with a Pinecone filter such as {"location": "Sanguem"} instead of
+    relying purely on vector similarity across the whole index.
+    """
     # Detect the file's actual encoding instead of relying on the
     # OS default (cp1252 on Windows), which breaks on non-ASCII bytes.
     detected = from_path(path).best()
     encoding = detected.encoding if detected else "utf-8"
 
     try:
-        loader = CSVLoader(file_path=path, encoding=encoding)
-        docs = loader.load()
+        df = pd.read_csv(path, encoding=encoding)
     except UnicodeDecodeError:
         # Last-resort fallback: latin-1 maps every byte 0-255,
         # so it will never raise, even if it's not a perfect guess.
-        loader = CSVLoader(file_path=path, encoding="latin-1")
-        docs = loader.load()
+        df = pd.read_csv(path, encoding="latin-1")
 
-    for i, doc in enumerate(docs):
-        doc.metadata["source_file"] = filename
-        doc.metadata["file_type"] = "csv"
-        doc.metadata["row"] = i
+    df = df.fillna("")
+    columns = [str(c) for c in df.columns]
+    _register_categorical_columns(df, columns)
+
+    docs: List[Document] = []
+    for row_idx, row in df.iterrows():
+        row_text = "\n".join(f"{col}: {row[col]}" for col in columns)
+        metadata = {
+            "source_file": filename,
+            "file_type": "csv",
+            "row": int(row_idx),
+        }
+        metadata.update(_row_metadata(row, columns))
+        docs.append(Document(page_content=row_text, metadata=metadata))
+
     return docs
 
 
@@ -479,7 +717,9 @@ def load_excel(path: str, filename: str) -> List[Document]:
     """
     Load an Excel workbook into LangChain Documents.
     Every sheet is read, and each row becomes its own Document so that
-    retrieval can point back to a specific sheet/row.
+    retrieval can point back to a specific sheet/row. As with load_csv,
+    every column is also promoted to a top-level metadata field so rows can
+    be filtered by e.g. location/category at query time.
     """
     docs: List[Document] = []
     try:
@@ -492,6 +732,7 @@ def load_excel(path: str, filename: str) -> List[Document]:
             continue
         df = df.fillna("")
         columns = [str(c) for c in df.columns]
+        _register_categorical_columns(df, columns)
 
         for row_idx, row in df.iterrows():
             row_text = "\n".join(f"{col}: {row[col]}" for col in columns)
@@ -502,6 +743,7 @@ def load_excel(path: str, filename: str) -> List[Document]:
                 "sheet": sheet_name,
                 "row": int(row_idx),
             }
+            metadata.update(_row_metadata(row, columns))
             docs.append(Document(page_content=content, metadata=metadata))
 
     return docs
@@ -568,10 +810,17 @@ class QueryRequest(BaseModel):
     # 0.4 is too strict or too loose for your corpus.
     min_score: float = 0.4
     summarize: bool = False
-    # FIX: generic metadata filter (e.g. {"taluka": "Tiswadi"},
+    # FIX: generic metadata filter (e.g. {"location": "Sanguem"},
     # {"source_file": "goa_places.csv"}) so a query can be scoped to a
     # subset of the index instead of always searching everything.
     filter: Optional[Dict[str, Any]] = None
+
+
+class DocumentsFilterRequest(BaseModel):
+    # Required — this endpoint always scopes by metadata, e.g.
+    # {"location": "Sanguem"} or {"category": "Hotel"}.
+    filter: Dict[str, Any]
+    limit: int = 100
 
 
 # ==========================================================
@@ -626,11 +875,39 @@ async def upload_file(file: UploadFile = File(...)):
 
 @app.post("/query")
 def query_documents(request: QueryRequest):
+    metadata_filter: Dict[str, Any] = dict(request.filter) if request.filter else {}
+
+    # Auto-scope using values seen during ingestion (category, sub_category,
+    # etc.) without overriding anything the caller already specified.
+    for field, value in detect_filters_from_text(request.query).items():
+        metadata_filter.setdefault(field, value)
+
+    # Taluka also gets a hardcoded fallback check — Goa's 12 talukas are a
+    # small, fixed, well-known list, so this still works even if a taluka
+    # column hasn't been ingested (or the registry was reset by a restart).
+    if "taluka" not in metadata_filter:
+        detected_taluka = detect_taluka_filter(request.query)
+        if detected_taluka:
+            metadata_filter["taluka"] = detected_taluka
+
     # Route through the RAG pipeline instead of hitting Pinecone directly
     return rag_pipeline.query(
         question=request.query,
         top_k=request.top_k,
         min_score=request.min_score,
         summarize=request.summarize,
-        metadata_filter=request.filter,
+        metadata_filter=metadata_filter or None,
     )
+
+
+@app.post("/documents")
+def list_documents(request: DocumentsFilterRequest):
+    """
+    Return every ingested row/chunk matching a metadata filter, e.g.
+    {"filter": {"location": "Sanguem"}} — no similarity ranking or
+    score_threshold involved, so this is the right call for "give me
+    everything about Sanguem" rather than /query, which only returns the
+    top_k most semantically relevant chunks.
+    """
+    docs = rag_retriever.list_by_filter(request.filter, limit=request.limit)
+    return {"count": len(docs), "documents": docs}
