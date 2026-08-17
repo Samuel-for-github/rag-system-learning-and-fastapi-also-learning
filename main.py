@@ -40,24 +40,34 @@ app.add_middleware(
     allow_headers=["*"],
 )
 from langchain_openrouter import ChatOpenRouter
-from langchain_huggingface import HuggingFaceEndpoint, ChatHuggingFace
+from langchain_openai import ChatOpenAI
 
-# openrouter_api_key = os.getenv("OPENROUTER_API_KEY")
-# if not openrouter_api_key:
-#     raise ValueError("OPENROUTER_API_KEY environment variable is not set")
-
-
-endpoint = HuggingFaceEndpoint(
-    repo_id="Qwen/Qwen2.5-72B-Instruct",
-    task="text-generation",
-    max_new_tokens=512,
-    temperature=0.2,
-    huggingfacehub_api_token=os.getenv("HF_API_TOKEN"),
+# --- LLM: vLLM served from a RunPod pod (OpenAI-compatible server) ---
+# vLLM's `vllm/vllm-openai` image exposes /v1/chat/completions, so a plain
+# ChatOpenAI client pointed at your pod's proxy URL works as a drop-in
+# replacement for the old HuggingFaceEndpoint/ChatHuggingFace setup — no
+# other code in this file (AdvancedRAGPipeline, etc.) needs to change since
+# they only call llm.invoke(...).
+VLLM_BASE_URL = os.getenv("VLLM_BASE_URL")
+VLLM_MODEL_NAME = os.getenv(
+    "VLLM_MODEL_NAME",
+    "Qwen/Qwen2.5-1.5B-Instruct"
 )
+VLLM_API_KEY = os.getenv("VLLM_API_KEY")
 
+if not VLLM_BASE_URL:
+    raise ValueError("VLLM_BASE_URL environment variable is not set")
 
-llm = ChatHuggingFace(llm=endpoint)
+if not VLLM_API_KEY:
+    raise ValueError("VLLM_API_KEY environment variable is not set")
 
+llm = ChatOpenAI(
+    base_url=VLLM_BASE_URL.rstrip("/"),
+    api_key=VLLM_API_KEY,
+    model=VLLM_MODEL_NAME,
+    temperature=0.2,
+    max_tokens=512,
+)
 # File types this API can ingest
 SUPPORTED_EXTENSIONS = {".pdf", ".csv", ".xlsx", ".xls"}
 
@@ -84,6 +94,78 @@ GOA_TALUKAS = [
     "tiswadi", "bardez", "salcete", "mormugao", "ponda", "bicholim",
     "sanguem", "quepem", "canacona", "pernem", "sattari", "dharbandora",
 ]
+
+# ==========================================================
+# SESSION MANAGEMENT (for follow-up / multi-turn chat)
+# ==========================================================
+
+# How many past turns (user+assistant pairs) get fed back into prompts —
+# both the standalone-question condenser and the final answer prompt.
+# Kept small since vLLM here is running a small (1.5B) model with a modest
+# context window / max_tokens budget.
+SESSION_HISTORY_TURNS = 6
+
+# Idle sessions older than this get dropped on next access, so the
+# in-memory store doesn't grow forever across a long-running process.
+SESSION_TTL_SECONDS = 60 * 60 * 2  # 2 hours
+
+
+class SessionStore:
+    """
+    Minimal in-memory chat history store, keyed by session_id.
+
+    NOTE: this is process-local memory, not a database — history is lost on
+    restart and isn't shared across multiple API instances/workers. That's
+    fine for a single-process deployment; swap in Redis/Postgres if you
+    scale out horizontally.
+    """
+
+    def __init__(self):
+        self._sessions: Dict[str, Dict[str, Any]] = {}
+
+    def _expire_if_stale(self, session_id: str) -> None:
+        entry = self._sessions.get(session_id)
+        if entry and (time.time() - entry["last_active"] > SESSION_TTL_SECONDS):
+            del self._sessions[session_id]
+
+    def exists(self, session_id: str) -> bool:
+        self._expire_if_stale(session_id)
+        return session_id in self._sessions
+
+    def touch(self, session_id: str) -> None:
+        """Ensure a session entry exists and mark it as recently active."""
+        self._expire_if_stale(session_id)
+        if session_id not in self._sessions:
+            self._sessions[session_id] = {"messages": [], "last_active": time.time()}
+        else:
+            self._sessions[session_id]["last_active"] = time.time()
+
+    def get_history(self, session_id: Optional[str]) -> List[Dict[str, str]]:
+        if not session_id:
+            return []
+        self._expire_if_stale(session_id)
+        entry = self._sessions.get(session_id)
+        return list(entry["messages"]) if entry else []
+
+    def append(self, session_id: str, role: str, content: str) -> None:
+        self.touch(session_id)
+        self._sessions[session_id]["messages"].append({"role": role, "content": content})
+
+    def clear(self, session_id: str) -> None:
+        self._sessions.pop(session_id, None)
+
+
+session_store = SessionStore()
+
+
+def format_history(history: List[Dict[str, str]], limit_turns: int = SESSION_HISTORY_TURNS) -> str:
+    """Render the last `limit_turns` user/assistant pairs as plain text for prompting."""
+    if not history:
+        return ""
+    # history is a flat list of alternating {"role": "user"/"assistant", ...}
+    # entries; keep the most recent 2*limit_turns messages.
+    recent = history[-(limit_turns * 2):]
+    return "\n".join(f"{m['role'].capitalize()}: {m['content']}" for m in recent)
 
 
 def detect_taluka_filter(text: str) -> Optional[str]:
@@ -336,7 +418,41 @@ class AdvancedRAGPipeline:
     def __init__(self, retriever, llm):
         self.retriever = retriever
         self.llm = llm
-        self.history = []  # Store query history
+        self.history = []  # Store flat query history across all sessions (debug/back-compat)
+
+    def _condense_followup(self, question: str, history: List[Dict[str, str]]) -> str:
+        """
+        Rewrite a follow-up question into a standalone one using prior
+        conversation turns, so retrieval (embedding search + metadata
+        filter detection) isn't blind to context like "there"/"it"/"what
+        about hotels" that only makes sense given earlier turns.
+
+        Falls back to the original question if there's no history, or if
+        the LLM call fails for any reason (retrieval on the raw follow-up
+        is still better than erroring out).
+        """
+        if not history:
+            return question
+
+        convo = format_history(history)
+        condense_prompt = f"""Given the conversation history and a follow-up question, rewrite the follow-up question as a standalone question that includes all necessary context from the conversation. If the follow-up question is already standalone, return it unchanged.
+
+Respond with ONLY the rewritten standalone question — no explanation, no quotes.
+
+Conversation history:
+{convo}
+
+Follow-up question: {question}
+
+Standalone question:"""
+
+        try:
+            resp = self.llm.invoke([condense_prompt])
+            condensed = (resp.content or "").strip().strip('"')
+            return condensed if condensed else question
+        except Exception as e:
+            print(f"Follow-up condensing failed, falling back to raw question: {e}")
+            return question
 
     def query(
         self,
@@ -346,13 +462,39 @@ class AdvancedRAGPipeline:
         stream: bool = False,
         summarize: bool = False,
         metadata_filter: Optional[Dict[str, Any]] = None,
+        session_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        # Retrieve relevant documents
+        # Pull prior turns for this session (empty list for a new/no session).
+        history = session_store.get_history(session_id)
+
+        # Rewrite follow-ups ("what about hotels there?") into a standalone
+        # question using conversation context, before retrieval/filtering.
+        search_question = self._condense_followup(question, history)
+        if search_question != question:
+            print(f"Condensed follow-up: '{question}' -> '{search_question}'")
+
+        # Auto-scope using values seen during ingestion (category,
+        # sub_category, etc.), without overriding anything the caller
+        # already specified explicitly.
+        metadata_filter = dict(metadata_filter) if metadata_filter else {}
+        for field, value in detect_filters_from_text(search_question).items():
+            metadata_filter.setdefault(field, value)
+
+        # Taluka also gets a hardcoded fallback check — Goa's 12 talukas are
+        # a small, fixed, well-known list, so this still works even if a
+        # taluka column hasn't been ingested (or the registry was reset by
+        # a restart).
+        if "taluka" not in metadata_filter:
+            detected_taluka = detect_taluka_filter(search_question)
+            if detected_taluka:
+                metadata_filter["taluka"] = detected_taluka
+
+        # Retrieve relevant documents using the (possibly condensed) question
         results = self.retriever.retrieve(
-            question,
+            search_question,
             top_k=top_k,
             score_threshold=min_score,
-            metadata_filter=metadata_filter,
+            metadata_filter=metadata_filter or None,
         )
 
         # FIX: debug visibility into exactly what's being handed to the LLM,
@@ -377,6 +519,14 @@ class AdvancedRAGPipeline:
                 'preview': doc['content'][:120] + '...'
             } for doc in results]
 
+            # Include recent chat history so the model can resolve
+            # pronouns/references ("it", "there", "that place") and keep a
+            # conversational thread, while still being told to only pull
+            # facts from the retrieved Context block below.
+            history_block = ""
+            if history:
+                history_block = f"Conversation history (for context only — do not treat as source material):\n{format_history(history)}\n\n"
+
             # FIX: strict grounding prompt — the old version only *suggested*
             # using the context, which left the LLM free to blend in outside
             # knowledge or invent details not actually retrieved.
@@ -385,11 +535,12 @@ class AdvancedRAGPipeline:
 Rules:
 - Use ONLY the information in the context to answer. Do NOT use outside knowledge, even if you know the answer.
 - Do NOT guess, infer, or add details that are not explicitly present in the context.
+- You may use the conversation history to understand what the user is referring to (e.g. pronouns like "it" or "there"), but never pull facts from the history itself — only from the context.
 - If the context does not contain enough information to answer, respond exactly with:
   "I don't have information about this in the provided documents."
 - Keep the answer concise and grounded strictly in the context.
 
-Context:
+{history_block}Context:
 {context}
 
 Question: {question}
@@ -420,7 +571,8 @@ Answer:"""
             summary_resp = self.llm.invoke([summary_prompt])
             summary = summary_resp.content
 
-        # Store query history
+        # Store query history — both the flat/global debug log and, if a
+        # session_id was supplied, the per-session store used for follow-ups.
         self.history.append({
             'question': question,
             'answer': answer,
@@ -428,12 +580,18 @@ Answer:"""
             'summary': summary
         })
 
+        if session_id:
+            session_store.append(session_id, "user", question)
+            session_store.append(session_id, "assistant", answer)
+
         return {
             'question': question,
+            'search_question': search_question,
             'answer': answer,
             'sources': sources,
             'citations': citations,
             'summary': summary,
+            'session_id': session_id,
             'history': self.history
         }
 
@@ -814,6 +972,12 @@ class QueryRequest(BaseModel):
     # {"source_file": "goa_places.csv"}) so a query can be scoped to a
     # subset of the index instead of always searching everything.
     filter: Optional[Dict[str, Any]] = None
+    # Chat session support: pass back the session_id you got from a
+    # previous /query response to ask a follow-up question that has access
+    # to that conversation's history. Omit (or pass a brand-new id) to
+    # start a fresh conversation — a new session_id is generated and
+    # returned either way.
+    session_id: Optional[str] = None
 
 
 class DocumentsFilterRequest(BaseModel):
@@ -875,29 +1039,44 @@ async def upload_file(file: UploadFile = File(...)):
 
 @app.post("/query")
 def query_documents(request: QueryRequest):
-    metadata_filter: Dict[str, Any] = dict(request.filter) if request.filter else {}
+    # Always hand back a session_id — either the one the caller supplied
+    # (so follow-ups keep accumulating in the same conversation) or a fresh
+    # one if this is the start of a new conversation.
+    session_id = request.session_id or str(uuid.uuid4())
 
-    # Auto-scope using values seen during ingestion (category, sub_category,
-    # etc.) without overriding anything the caller already specified.
-    for field, value in detect_filters_from_text(request.query).items():
-        metadata_filter.setdefault(field, value)
-
-    # Taluka also gets a hardcoded fallback check — Goa's 12 talukas are a
-    # small, fixed, well-known list, so this still works even if a taluka
-    # column hasn't been ingested (or the registry was reset by a restart).
-    if "taluka" not in metadata_filter:
-        detected_taluka = detect_taluka_filter(request.query)
-        if detected_taluka:
-            metadata_filter["taluka"] = detected_taluka
-
-    # Route through the RAG pipeline instead of hitting Pinecone directly
-    return rag_pipeline.query(
+    result = rag_pipeline.query(
         question=request.query,
         top_k=request.top_k,
         min_score=request.min_score,
         summarize=request.summarize,
-        metadata_filter=metadata_filter or None,
+        metadata_filter=dict(request.filter) if request.filter else None,
+        session_id=session_id,
     )
+    return result
+
+
+@app.post("/sessions")
+def create_session():
+    """Explicitly start a new empty chat session (optional — /query will
+    also create one automatically if you don't pass a session_id)."""
+    session_id = str(uuid.uuid4())
+    session_store.touch(session_id)
+    return {"session_id": session_id}
+
+
+@app.get("/sessions/{session_id}")
+def get_session(session_id: str):
+    """Fetch the stored conversation turns for a session."""
+    if not session_store.exists(session_id):
+        raise HTTPException(status_code=404, detail="Session not found or expired")
+    return {"session_id": session_id, "messages": session_store.get_history(session_id)}
+
+
+@app.delete("/sessions/{session_id}")
+def delete_session(session_id: str):
+    """Clear a session's history (e.g. user hits 'New chat')."""
+    session_store.clear(session_id)
+    return {"message": "Session cleared", "session_id": session_id}
 
 
 @app.post("/documents")
