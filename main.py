@@ -2,6 +2,9 @@ import os
 import re
 import uuid
 import tempfile
+import hashlib
+import json
+import threading
 from typing import List, Dict, Any, Optional
 from collections import defaultdict
 import time
@@ -248,6 +251,150 @@ def detect_filters_from_text(text: str) -> Dict[str, str]:
 
 
 # ==========================================================
+# CACHING
+# ==========================================================
+#
+# Three independent in-memory caches, each sized/TTL'd for what it stores:
+#
+#   - embedding_cache: text -> embedding vector. Embeddings for a given
+#     text+model never change, so this uses a long TTL. Saves a network
+#     round-trip to the HF Inference API for repeated texts (very common
+#     for query embeddings — popular questions repeat far more than
+#     ingested document chunks do).
+#   - retrieval_cache: (query, top_k, threshold, filter) -> retrieved docs.
+#     Short TTL, and explicitly cleared whenever new documents are added,
+#     since the correct answer to "what matches this filter" changes the
+#     moment the index changes.
+#   - llm_cache: exact prompt text -> generated text. Cleared alongside
+#     retrieval_cache on upload, since a stale cached answer could be
+#     grounded in context that's now outdated (a newer, better-matching
+#     document was just ingested).
+#
+# All three are process-local (same caveat as SessionStore — swap in Redis
+# etc. if you scale out horizontally).
+
+EMBEDDING_CACHE_TTL_SECONDS = 60 * 60 * 6   # 6 hours
+EMBEDDING_CACHE_MAX_SIZE = 5000
+
+RETRIEVAL_CACHE_TTL_SECONDS = 60 * 5        # 5 minutes
+RETRIEVAL_CACHE_MAX_SIZE = 500
+
+LLM_CACHE_TTL_SECONDS = 60 * 30             # 30 minutes
+LLM_CACHE_MAX_SIZE = 500
+
+
+class TTLCache:
+    """
+    Thread-safe in-memory cache with a per-entry TTL and a max-size cap.
+
+    Eviction once max_size is reached is FIFO (oldest-inserted key first)
+    rather than strict LRU — simple, and good enough here since hit
+    patterns are dominated by TTL expiry, not size pressure.
+    """
+
+    def __init__(self, ttl_seconds: float, max_size: int = 1000):
+        self.ttl_seconds = ttl_seconds
+        self.max_size = max_size
+        self._store: Dict[str, Any] = {}
+        self._timestamps: Dict[str, float] = {}
+        self._lock = threading.Lock()
+        self.hits = 0
+        self.misses = 0
+
+    def _is_expired(self, key: str) -> bool:
+        ts = self._timestamps.get(key)
+        return ts is None or (time.time() - ts) > self.ttl_seconds
+
+    def get(self, key: str) -> Any:
+        with self._lock:
+            if key in self._store and not self._is_expired(key):
+                self.hits += 1
+                return self._store[key]
+            if key in self._store:
+                # Present but expired — drop it so it doesn't linger.
+                del self._store[key]
+                del self._timestamps[key]
+            self.misses += 1
+            return None
+
+    def set(self, key: str, value: Any) -> None:
+        with self._lock:
+            if len(self._store) >= self.max_size and key not in self._store:
+                oldest_key = next(iter(self._store), None)
+                if oldest_key is not None:
+                    self._store.pop(oldest_key, None)
+                    self._timestamps.pop(oldest_key, None)
+            self._store[key] = value
+            self._timestamps[key] = time.time()
+
+    def clear(self) -> None:
+        with self._lock:
+            self._store.clear()
+            self._timestamps.clear()
+            self.hits = 0
+            self.misses = 0
+
+    def stats(self) -> Dict[str, Any]:
+        with self._lock:
+            total = self.hits + self.misses
+            return {
+                "size": len(self._store),
+                "max_size": self.max_size,
+                "ttl_seconds": self.ttl_seconds,
+                "hits": self.hits,
+                "misses": self.misses,
+                "hit_rate": round(self.hits / total, 3) if total else None,
+            }
+
+
+def _cache_key(*parts: Any) -> str:
+    """
+    Build a stable cache key from arbitrary parts (strings, dicts, lists,
+    numbers, ...) by JSON-serializing with sorted keys and hashing. Sorted
+    keys mean e.g. {"a": 1, "b": 2} and {"b": 2, "a": 1} hash identically,
+    and hashing keeps keys short/fixed-size regardless of how much text
+    (prompts, context) goes into them.
+    """
+    raw = json.dumps(parts, sort_keys=True, default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+embedding_cache = TTLCache(ttl_seconds=EMBEDDING_CACHE_TTL_SECONDS, max_size=EMBEDDING_CACHE_MAX_SIZE)
+retrieval_cache = TTLCache(ttl_seconds=RETRIEVAL_CACHE_TTL_SECONDS, max_size=RETRIEVAL_CACHE_MAX_SIZE)
+llm_cache = TTLCache(ttl_seconds=LLM_CACHE_TTL_SECONDS, max_size=LLM_CACHE_MAX_SIZE)
+
+
+def cached_llm_invoke(prompt: str) -> str:
+    """
+    Invoke the LLM with a cache keyed on the exact prompt text, so
+    identical prompts (the same question hitting the same retrieved
+    context, or a repeated follow-up condensation) skip a network
+    round-trip to the vLLM pod entirely.
+
+    Returns plain text (not the LangChain response object) since that's
+    all every caller in this file actually uses.
+    """
+    key = _cache_key("llm", VLLM_MODEL_NAME, prompt)
+    cached = llm_cache.get(key)
+    if cached is not None:
+        print("LLM cache hit")
+        return cached
+
+    response = llm.invoke([prompt])
+    content = response.content
+    llm_cache.set(key, content)
+    return content
+
+
+def invalidate_corpus_caches() -> None:
+    """Drop retrieval + LLM caches — call whenever the index's contents
+    change (new upload), since cached results may no longer be correct."""
+    retrieval_cache.clear()
+    llm_cache.clear()
+    print("Retrieval + LLM caches invalidated after index change")
+
+
+# ==========================================================
 # EMBEDDING MANAGER
 # ==========================================================
 
@@ -267,27 +414,57 @@ class EmbeddingManager:
         """
         Generate embeddings for a list of texts via HF's hosted inference API.
 
+        Per-text results are served from `embedding_cache` where available —
+        only texts that miss the cache are actually sent to the API — and
+        results are stitched back together in the original input order.
+
         Args:
             texts: List of text strings to embed
 
         Returns:
             numpy array of embeddings with shape (len(texts), embedding_dim)
         """
-        print(f"Generating embeddings for {len(texts)} texts via HF Inference API...")
+        cached_vectors: Dict[int, np.ndarray] = {}
+        texts_to_fetch: List[str] = []
+        fetch_indices: List[int] = []
 
-        response = requests.post(
-            self.api_url,
-            headers=self.headers,
-            json={"inputs": texts, "options": {"wait_for_model": True}},
-            timeout=60,
-        )
+        for i, text in enumerate(texts):
+            key = _cache_key("embed", self.model_name, text)
+            cached = embedding_cache.get(key)
+            if cached is not None:
+                cached_vectors[i] = cached
+            else:
+                texts_to_fetch.append(text)
+                fetch_indices.append(i)
 
-        if response.status_code != 200:
-            raise RuntimeError(
-                f"HF Inference API error {response.status_code}: {response.text}"
+        if texts_to_fetch:
+            print(
+                f"Generating embeddings for {len(texts_to_fetch)}/{len(texts)} texts via "
+                f"HF Inference API ({len(texts) - len(texts_to_fetch)} served from cache)..."
             )
 
-        embeddings = np.array(response.json())
+            response = requests.post(
+                self.api_url,
+                headers=self.headers,
+                json={"inputs": texts_to_fetch, "options": {"wait_for_model": True}},
+                timeout=60,
+            )
+
+            if response.status_code != 200:
+                raise RuntimeError(
+                    f"HF Inference API error {response.status_code}: {response.text}"
+                )
+
+            fetched = np.array(response.json())
+            for local_i, global_i in enumerate(fetch_indices):
+                vec = fetched[local_i]
+                cached_vectors[global_i] = vec
+                key = _cache_key("embed", self.model_name, texts[global_i])
+                embedding_cache.set(key, vec)
+        else:
+            print(f"All {len(texts)} text(s) served from embedding cache.")
+
+        embeddings = np.array([cached_vectors[i] for i in range(len(texts))])
         print(f"Generated embeddings with shape: {embeddings.shape}")
         return embeddings
 embedding_manager = EmbeddingManager()
@@ -403,6 +580,12 @@ class VectorStore:
             print(f"Successfully added {len(documents)} documents to vector store")
             print(f"Total vectors in index: {self.count()}")
 
+            # CACHE: the index's contents just changed, so any previously
+            # cached retrieval results / LLM answers may now be stale or
+            # incomplete (e.g. a newly-ingested row is a better match than
+            # what got cached before it existed).
+            invalidate_corpus_caches()
+
         except Exception as e:
             print(f"Error adding documents to vector store: {e}")
             raise
@@ -447,8 +630,7 @@ Follow-up question: {question}
 Standalone question:"""
 
         try:
-            resp = self.llm.invoke([condense_prompt])
-            condensed = (resp.content or "").strip().strip('"')
+            condensed = (cached_llm_invoke(condense_prompt) or "").strip().strip('"')
             return condensed if condensed else question
         except Exception as e:
             print(f"Follow-up condensing failed, falling back to raw question: {e}")
@@ -554,12 +736,9 @@ Answer:"""
                     time.sleep(0.05)
                 print()
 
-            # FIX: previously this called prompt.format(context=context, question=question)
-            # on a string that was already an f-string with those values filled in.
-            # If any retrieved chunk contained a literal "{" or "}" (JSON, notes, etc.),
-            # that second .format() call would raise or silently corrupt the prompt.
-            response = self.llm.invoke([prompt])
-            answer = response.content
+            # CACHE: identical prompts (same question, same retrieved
+            # context, same history) skip the round-trip to the vLLM pod.
+            answer = cached_llm_invoke(prompt)
 
         # Add citations to answer
         citations = [f"[{i+1}] {src['source']} (page {src['page']})" for i, src in enumerate(sources)]
@@ -568,8 +747,7 @@ Answer:"""
         summary = None
         if summarize and answer:
             summary_prompt = f"Summarize the following answer in 2 sentences:\n{answer}"
-            summary_resp = self.llm.invoke([summary_prompt])
-            summary = summary_resp.content
+            summary = cached_llm_invoke(summary_prompt)
 
         # Store query history — both the flat/global debug log and, if a
         # session_id was supplied, the per-session store used for follow-ups.
@@ -644,6 +822,15 @@ class RAGRetriever:
         # casing the caller/LLM produced before it ever reaches Pinecone.
         metadata_filter = normalize_metadata_filter(metadata_filter)
 
+        # CACHE: same (query, top_k, threshold, filter) combo skips both the
+        # embedding call and the Pinecone query entirely. Short TTL, and
+        # explicitly dropped on any new upload (see invalidate_corpus_caches).
+        cache_key = _cache_key("retrieve", query, top_k, score_threshold, metadata_filter)
+        cached = retrieval_cache.get(cache_key)
+        if cached is not None:
+            print(f"Retrieval cache hit for query: '{query}' (filter={metadata_filter})")
+            return cached
+
         print(f"Retrieving documents for query: '{query}'")
         print(f"Top K: {top_k}, Score threshold: {score_threshold}, Filter: {metadata_filter}")
 
@@ -691,6 +878,7 @@ class RAGRetriever:
             else:
                 print("No documents found")
 
+            retrieval_cache.set(cache_key, retrieved_docs)
             return retrieved_docs
 
         except Exception as e:
@@ -724,6 +912,14 @@ class RAGRetriever:
 
         metadata_filter = normalize_metadata_filter(metadata_filter)
 
+        # CACHE: same as retrieve() — same filter/limit combo is served from
+        # the shared retrieval cache instead of re-hitting Pinecone.
+        cache_key = _cache_key("list_by_filter", metadata_filter, limit)
+        cached = retrieval_cache.get(cache_key)
+        if cached is not None:
+            print(f"Retrieval cache hit for list_by_filter: {metadata_filter}")
+            return cached
+
         # FIX: an all-zero vector has undefined cosine similarity, and some
         # Pinecone index configurations return zero matches for it even
         # when the metadata filter alone would match plenty of rows. Use a
@@ -749,6 +945,8 @@ class RAGRetriever:
                 'content': document_text,
                 'metadata': metadata,
             })
+
+        retrieval_cache.set(cache_key, docs)
         return docs
 
 rag_retriever=RAGRetriever(vectorstore,embedding_manager)
@@ -999,6 +1197,39 @@ def root():
 @app.get("/health")
 def health():
     return {"status": "healthy", "documents": vectorstore.count()}
+
+
+@app.get("/cache/stats")
+def cache_stats():
+    """Inspect hit/miss/size stats for each in-memory cache layer."""
+    return {
+        "embedding_cache": embedding_cache.stats(),
+        "retrieval_cache": retrieval_cache.stats(),
+        "llm_cache": llm_cache.stats(),
+    }
+
+
+@app.post("/cache/clear")
+def cache_clear(target: Optional[str] = None):
+    """
+    Manually clear cache(s). `target` is optional and one of
+    "embedding", "retrieval", "llm" — omit it to clear all three.
+    """
+    valid_targets = {"embedding": embedding_cache, "retrieval": retrieval_cache, "llm": llm_cache}
+
+    if target is None:
+        for cache in valid_targets.values():
+            cache.clear()
+        return {"message": "All caches cleared"}
+
+    cache = valid_targets.get(target)
+    if cache is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown cache target '{target}'. Valid options: {sorted(valid_targets)}"
+        )
+    cache.clear()
+    return {"message": f"'{target}' cache cleared"}
 
 
 @app.post("/upload")
