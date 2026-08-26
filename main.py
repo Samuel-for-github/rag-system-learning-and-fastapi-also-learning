@@ -98,6 +98,150 @@ GOA_TALUKAS = [
     "sanguem", "quepem", "canacona", "pernem", "sattari", "dharbandora",
 ]
 
+# Approximate center point (lat, lng) for each of Goa's 12 talukas. Used to
+# reverse-geocode a user's live GPS coordinates to the nearest taluka via
+# simple nearest-centroid matching (see nearest_taluka below) — no external
+# geocoding API needed, and no taluka boundary/polygon data required.
+#
+# NOTE: these are approximate town/administrative-center coordinates, not
+# precise taluka boundary centroids, so results near a taluka border can be
+# coarse (e.g. a point right on the Bardez/Bicholim line might resolve to
+# either neighbor). Good enough for a "which taluka am I probably in / near"
+# signal; swap in real boundary polygons + point-in-polygon matching later
+# if finer accuracy is needed.
+GOA_TALUKA_CENTROIDS: Dict[str, tuple] = {
+    "tiswadi": (15.4909, 73.8278),      # Panaji
+    "bardez": (15.5937, 73.8142),       # Mapusa
+    "salcete": (15.2832, 73.9862),      # Margao
+    "mormugao": (15.3960, 73.8157),     # Vasco da Gama
+    "ponda": (15.4027, 74.0078),        # Ponda town
+    "bicholim": (15.5936, 73.9490),     # Bicholim town
+    "sanguem": (15.2214, 74.1636),      # Sanguem town
+    "quepem": (15.2141, 74.0797),       # Quepem town
+    "canacona": (15.0100, 74.0450),     # Canacona/Chaudi
+    "pernem": (15.7167, 73.7970),       # Pernem town
+    "sattari": (15.5833, 74.1167),      # Valpoi
+    "dharbandora": (15.3833, 74.1000),  # Dharbandora town
+}
+
+
+def _haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    """Great-circle distance in km between two lat/lng points."""
+    r = 6371.0  # Earth radius, km
+    p1, p2 = np.radians(lat1), np.radians(lat2)
+    dphi = np.radians(lat2 - lat1)
+    dlambda = np.radians(lng2 - lng1)
+    a = np.sin(dphi / 2) ** 2 + np.cos(p1) * np.cos(p2) * np.sin(dlambda / 2) ** 2
+    return 2 * r * np.arcsin(np.sqrt(a))
+
+
+def _nearest_taluka_by_centroid(lat: float, lng: float) -> Optional[str]:
+    """
+    Fallback reverse-geocode: nearest taluka by straight-line distance to
+    each taluka's approximate center point (GOA_TALUKA_CENTROIDS). Coarser
+    than real polygon matching (see taluka_from_point below) — used only
+    when a real boundary isn't available (Dharbandora, see
+    TALUKA_POLYGONS_MISSING) or as a small-radius "just outside the
+    polygon" rescue for points that miss every real boundary narrowly
+    (GPS error, coastline rounding, etc).
+    """
+    best_taluka = None
+    best_distance = float("inf")
+    for taluka, (t_lat, t_lng) in GOA_TALUKA_CENTROIDS.items():
+        dist = _haversine_km(lat, lng, t_lat, t_lng)
+        if dist < best_distance:
+            best_distance = dist
+            best_taluka = taluka
+
+    if best_taluka is None or best_distance > 60:
+        return None
+    return best_taluka
+
+
+# ---- Real taluka boundary polygons (point-in-polygon reverse geocoding) ----
+#
+# Loaded from goa_talukas.geojson, which was built from an all-India GADM
+# taluk boundary file, filtered to Goa's 12 talukas, and normalized so each
+# feature's "taluka" property matches the lowercase names already used in
+# Pinecone metadata (see _row_metadata). One caveat carried over from that
+# source data: Dharbandora taluka (carved out of Ponda/Sanguem in 1996) has
+# no separate polygon in this dataset's boundary vintage, so it falls back
+# to centroid-distance matching (_nearest_taluka_by_centroid) instead of a
+# real polygon — see TALUKA_POLYGONS_MISSING below.
+_GEOJSON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "goa_talukas.geojson")
+
+TALUKA_POLYGONS: Dict[str, Any] = {}
+TALUKA_POLYGONS_MISSING = {"dharbandora"}  # known gap — see comment above
+
+try:
+    from shapely.geometry import shape as _shapely_shape, Point as _shapely_Point
+    from shapely.strtree import STRtree as _shapely_STRtree
+
+    with open(_GEOJSON_PATH) as _f:
+        _geojson = json.load(_f)
+
+    TALUKA_POLYGONS = {
+        feat["properties"]["taluka"]: _shapely_shape(feat["geometry"])
+        for feat in _geojson["features"]
+    }
+    print(f"Loaded {len(TALUKA_POLYGONS)} taluka boundary polygons from {_GEOJSON_PATH}")
+except FileNotFoundError:
+    print(f"WARNING: {_GEOJSON_PATH} not found — falling back to centroid-only taluka detection for ALL talukas")
+except ImportError:
+    print("WARNING: shapely not installed — falling back to centroid-only taluka detection for ALL talukas")
+
+
+def taluka_from_point(lat: float, lng: float, near_miss_buffer_km: float = 1.0) -> Optional[str]:
+    """
+    Reverse-geocode a lat/lng pair to a Goa taluka using real polygon
+    boundaries when available (point-in-polygon — exact, handles irregular
+    borders correctly), falling back to nearest-centroid matching when a
+    polygon isn't available (Dharbandora, or if the boundary file/shapely
+    failed to load).
+
+    Also rescues "near misses": GPS readings have real-world error, and a
+    point sitting right on a coastline or a taluka border can fall just
+    outside every polygon even though the person is clearly in that taluka.
+    If no polygon contains the point outright, this checks whether the
+    point is within `near_miss_buffer_km` of any polygon's edge before
+    giving up and falling back to centroid matching.
+
+    Returns None if the point is nowhere near Goa at all.
+    """
+    if TALUKA_POLYGONS:
+        point = _shapely_Point(lng, lat)  # GeoJSON/shapely order: (lng, lat)
+
+        # Exact match: point genuinely falls inside a taluka's boundary.
+        for taluka, polygon in TALUKA_POLYGONS.items():
+            if polygon.contains(point):
+                return taluka
+
+        # Near miss: just outside every polygon (GPS error, coastline,
+        # a border that's fuzzy at this resolution). Roughly convert the
+        # buffer from km to degrees (1 deg latitude ~= 111km) — approximate,
+        # but fine for a small rescue radius like this.
+        buffer_deg = near_miss_buffer_km / 111.0
+        best_taluka, best_dist = None, float("inf")
+        for taluka, polygon in TALUKA_POLYGONS.items():
+            dist = polygon.distance(point)
+            if dist < best_dist:
+                best_dist, best_taluka = dist, taluka
+        if best_taluka is not None and best_dist <= buffer_deg:
+            return best_taluka
+
+    # No real polygons loaded, or the point missed all of them (including
+    # the near-miss buffer) — e.g. Dharbandora, which has no polygon at
+    # all, or a point genuinely outside Goa. Centroid matching still
+    # enforces a 60km-from-Goa sanity cutoff, so this won't force a match
+    # for e.g. a coordinate in another city.
+    return _nearest_taluka_by_centroid(lat, lng)
+
+
+# Backwards-compatible alias — existing callers (AdvancedRAGPipeline.query,
+# the /location/taluka route) use this name; it now does real polygon
+# matching instead of pure centroid-distance.
+nearest_taluka = taluka_from_point
+
 # ==========================================================
 # SESSION MANAGEMENT (for follow-up / multi-turn chat)
 # ==========================================================
@@ -645,6 +789,8 @@ Standalone question:"""
         summarize: bool = False,
         metadata_filter: Optional[Dict[str, Any]] = None,
         session_id: Optional[str] = None,
+        user_lat: Optional[float] = None,
+        user_lng: Optional[float] = None,
     ) -> Dict[str, Any]:
         # Pull prior turns for this session (empty list for a new/no session).
         history = session_store.get_history(session_id)
@@ -670,6 +816,21 @@ Standalone question:"""
             detected_taluka = detect_taluka_filter(search_question)
             if detected_taluka:
                 metadata_filter["taluka"] = detected_taluka
+
+        # LOCATION: last-resort fallback — only used if the user didn't
+        # name a place explicitly (by text match above) and didn't pass an
+        # explicit filter. An explicitly-typed location always wins over
+        # GPS position: "restaurants in Bardez" should scope to Bardez even
+        # if the user is currently standing in Salcete.
+        location_inferred_taluka = None
+        if "taluka" not in metadata_filter and user_lat is not None and user_lng is not None:
+            location_inferred_taluka = nearest_taluka(user_lat, user_lng)
+            if location_inferred_taluka:
+                metadata_filter["taluka"] = location_inferred_taluka
+                print(
+                    f"Inferred taluka '{location_inferred_taluka}' from user location "
+                    f"({user_lat}, {user_lng})"
+                )
 
         # Retrieve relevant documents using the (possibly condensed) question
         results = self.retriever.retrieve(
@@ -770,7 +931,8 @@ Answer:"""
             'citations': citations,
             'summary': summary,
             'session_id': session_id,
-            'history': self.history
+            'history': self.history,
+            'location_inferred_taluka': location_inferred_taluka,
         }
 
 
@@ -1176,6 +1338,13 @@ class QueryRequest(BaseModel):
     # start a fresh conversation — a new session_id is generated and
     # returned either way.
     session_id: Optional[str] = None
+    # Optional live GPS coordinates. If provided, and the question doesn't
+    # already name/imply a specific taluka (by text match or an explicit
+    # `filter`), the query is automatically scoped to whichever taluka the
+    # user is nearest to — so "any good seafood restaurants nearby" can
+    # resolve to an actual place instead of guessing from chat history.
+    user_lat: Optional[float] = None
+    user_lng: Optional[float] = None
 
 
 class DocumentsFilterRequest(BaseModel):
@@ -1282,8 +1451,24 @@ def query_documents(request: QueryRequest):
         summarize=request.summarize,
         metadata_filter=dict(request.filter) if request.filter else None,
         session_id=session_id,
+        user_lat=request.user_lat,
+        user_lng=request.user_lng,
     )
     return result
+
+
+@app.get("/location/taluka")
+def location_taluka(lat: float, lng: float):
+    """
+    Standalone reverse-geocode: given GPS coordinates, return the nearest
+    Goa taluka. Handy for testing the location feature independently of a
+    full /query call, or for a frontend to show "Detected: Bardez" near a
+    location prompt before the user even asks a question.
+    """
+    taluka = nearest_taluka(lat, lng)
+    if taluka is None:
+        return {"lat": lat, "lng": lng, "taluka": None, "message": "Location too far from Goa to infer a taluka"}
+    return {"lat": lat, "lng": lng, "taluka": taluka}
 
 
 @app.post("/sessions")
