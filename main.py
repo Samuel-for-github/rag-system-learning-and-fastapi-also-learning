@@ -9,6 +9,7 @@ from typing import List, Dict, Any, Optional
 from collections import defaultdict
 import time
 import numpy as np
+from fastapi import Header
 import pandas as pd
 from pinecone import Pinecone, ServerlessSpec
 from fastapi import FastAPI, UploadFile, File, HTTPException
@@ -25,7 +26,7 @@ load_dotenv()
 
 app = FastAPI(title="RAG API")
 from fastapi.middleware.cors import CORSMiddleware
-
+ADMIN_KEY = os.getenv("ADMIN_KEY")
 
 
 origins = [
@@ -1506,3 +1507,25 @@ def list_documents(request: DocumentsFilterRequest):
     """
     docs = rag_retriever.list_by_filter(request.filter, limit=request.limit)
     return {"count": len(docs), "documents": docs}
+
+@app.post("/admin/cleanup")
+def admin_cleanup(x_admin_key: str = Header(None)):
+    if not ADMIN_KEY or x_admin_key != ADMIN_KEY:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    now = time.time()
+    stale = [
+        sid for sid, entry in session_store._sessions.items()
+        if now - entry["last_active"] > SESSION_TTL_SECONDS
+    ]
+    for sid in stale:
+        session_store.clear(sid)
+
+    return {
+        "purged_sessions": len(stale),
+        "cache_stats": {
+            "embedding": embedding_cache.stats(),
+            "retrieval": retrieval_cache.stats(),
+            "llm": llm_cache.stats(),
+        },
+    }
