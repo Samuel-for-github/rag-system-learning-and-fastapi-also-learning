@@ -396,6 +396,132 @@ def detect_filters_from_text(text: str) -> Dict[str, str]:
 
 
 # ==========================================================
+# INTENT DETECTION (mood / need -> category)
+# ==========================================================
+# Free-form things people actually type ("im so bored", "starving rn",
+# "wanna have some fun tonight") don't name a taluka or a category value
+# directly, so they never trip detect_taluka_filter / detect_filters_from_text.
+# This layer catches common moods/needs and turns them into:
+#   (a) extra text appended to the *retrieval* query, so embedding search
+#       still surfaces relevant chunks even though the raw question never
+#       says "restaurant" / "beach" / etc., and
+#   (b) a candidate category filter — but ONLY if the ingested dataset
+#       actually has a matching category value (checked against
+#       FIELD_VALUE_REGISTRY), so we never force a filter the data can't
+#       satisfy.
+
+INTENT_PATTERNS: Dict[str, List[str]] = {
+    "hungry": [
+        r"\bhungry\b", r"\bstarving\b", r"\bfamished\b", r"\bwant(?:ed)? to eat\b",
+        r"\bneed (?:to|some) (?:food|eat)\b", r"\bgrab (?:a bite|food|lunch|dinner|breakfast)\b",
+        r"\bwhere (?:can|should) i eat\b", r"\bfeel like eating\b",
+    ],
+    "bored": [
+        r"\bbored\b", r"\bboring\b", r"\bnothing to do\b", r"\bkilling time\b",
+        r"\bwhat (?:can|should) i do\b", r"\bany(?:thing)? (?:fun )?to do\b",
+    ],
+    "fun": [
+        r"\bwant(?:ed)? to have (?:some )?fun\b", r"\bhave (?:some )?fun\b",
+        r"\blooking for fun\b", r"\bexciting\b", r"\badventure\b", r"\bthrill\b", r"\bparty\b",
+    ],
+    "relax": [
+        r"\btired\b", r"\bstressed\b", r"\bneed to relax\b", r"\bwant to (?:relax|unwind|chill)\b",
+        r"\bpeaceful\b", r"\bquiet place\b", r"\bde-?stress\b",
+    ],
+    "romantic": [
+        r"\bromantic\b", r"\bdate night\b",
+        r"\bwith my (?:partner|boyfriend|girlfriend|wife|husband)\b",
+        r"\banniversary\b", r"\bcandlelight\b",
+    ],
+    "nature": [
+        r"\bnature\b", r"\boutdoors?\b", r"\bfresh air\b", r"\bgreenery\b", r"\bwildlife\b",
+    ],
+    "shopping": [
+        r"\bshopping\b", r"\bbuy (?:something|souvenirs)\b", r"\bmarket\b",
+    ],
+    "nightlife": [
+        r"\bnightlife\b", r"\bclub(?:bing)?\b", r"\bbar(?:s)?\b", r"\bdrink(?:s)?\b", r"\bpub\b",
+    ],
+    "family": [
+        r"\bwith (?:my )?kids?\b", r"\bfamily friendly\b", r"\bwith (?:my )?family\b", r"\bchildren\b",
+    ],
+}
+
+# Extra text appended to the retrieval query for each intent — helps
+# embedding similarity even when the ingested chunk text never uses the
+# person's exact words ("bored" won't match a beach shack's description,
+# but "things to do activities attractions" will pull it in).
+INTENT_QUERY_EXPANSION: Dict[str, str] = {
+    "hungry": "restaurant food dining eat",
+    "bored": "things to do activities attractions",
+    "fun": "fun activities entertainment adventure",
+    "relax": "relaxing peaceful quiet spot",
+    "romantic": "romantic date spot scenic",
+    "nature": "nature outdoors park wildlife",
+    "shopping": "shopping market souvenirs",
+    "nightlife": "nightlife bar club pub",
+    "family": "family friendly kids activities",
+}
+
+# Candidate category words per intent — only applied as an actual metadata
+# filter if one of them (loosely) matches a real value seen during
+# ingestion (see resolve_intent_category below).
+INTENT_CATEGORY_HINTS: Dict[str, List[str]] = {
+    "hungry": ["restaurant", "food", "cafe", "dining", "eatery", "shack"],
+    "bored": ["attraction", "activity", "entertainment", "sightseeing"],
+    "fun": ["adventure", "activity", "entertainment", "water sport", "amusement"],
+    "relax": ["spa", "wellness", "beach", "resort", "garden"],
+    "romantic": ["restaurant", "resort", "beach", "scenic point"],
+    "nature": ["park", "wildlife sanctuary", "waterfall", "nature", "garden"],
+    "shopping": ["market", "shopping", "mall", "store"],
+    "nightlife": ["bar", "club", "pub", "nightlife"],
+    "family": ["park", "attraction", "amusement", "beach"],
+}
+
+
+def detect_intent(text: str) -> Optional[str]:
+    """
+    Match free text against INTENT_PATTERNS and return the first matching
+    intent key ("hungry", "bored", "fun", ...), or None if nothing matches.
+    Dict-definition order acts as priority if two intents could both match.
+    """
+    lowered = text.lower()
+    for intent, patterns in INTENT_PATTERNS.items():
+        for pattern in patterns:
+            if re.search(pattern, lowered):
+                return intent
+    return None
+
+
+def resolve_intent_category(intent: str) -> Optional[tuple]:
+    """
+    Try to back an intent with a REAL ingested category value, by checking
+    INTENT_CATEGORY_HINTS against FIELD_VALUE_REGISTRY (built from your
+    actual CSV/Excel data — see _register_categorical_columns). Prefers an
+    explicit category/type/sub_category field if one was registered, falls
+    back to scanning every registered field otherwise.
+
+    Returns (field_name, value) to use as a metadata_filter entry, or None
+    if nothing in the dataset matches — better to skip the filter than
+    force a wrong one that zeroes out retrieval.
+    """
+    hints = INTENT_CATEGORY_HINTS.get(intent, [])
+    if not hints:
+        return None
+
+    candidate_fields = [f for f in ("category", "type", "sub_category") if f in FIELD_VALUE_REGISTRY]
+    fields_to_check = candidate_fields or list(FIELD_VALUE_REGISTRY.keys())
+
+    for field in fields_to_check:
+        registered_values = FIELD_VALUE_REGISTRY.get(field, set())
+        for hint in hints:
+            for val in registered_values:
+                if hint in val or val in hint:
+                    return field, val
+    return None
+
+
+# ==========================================================
 # CACHING
 # ==========================================================
 #
@@ -833,9 +959,44 @@ Standalone question:"""
                     f"({user_lat}, {user_lng})"
                 )
 
-        # Retrieve relevant documents using the (possibly condensed) question
+        # INTENT: catch moods/needs ("im hungry", "so bored", "want to have
+        # fun") that don't name a place/category directly. Expands the
+        # *retrieval* query with related terms, and adds a category filter
+        # only if the ingested dataset actually has a matching value.
+        detected_intent = detect_intent(search_question)
+        search_question_for_retrieval = search_question
+        if detected_intent:
+            expansion = INTENT_QUERY_EXPANSION.get(detected_intent, "")
+            if expansion:
+                search_question_for_retrieval = f"{search_question} {expansion}"
+
+            resolved_category = resolve_intent_category(detected_intent)
+            if resolved_category:
+                field, value = resolved_category
+                metadata_filter.setdefault(field, value)
+                print(f"Intent '{detected_intent}' resolved to filter {field}={value}")
+            else:
+                print(f"Intent '{detected_intent}' detected but no matching ingested category — expanding query only")
+
+        # ANSWER PROMPT: a raw mood/need phrase like "i am hungry" isn't a
+        # literal question about the retrieved context, and small LLMs
+        # under a strict "only answer what's explicitly asked" grounding
+        # prompt will often bail out with "I don't have information" even
+        # though the retrieved chunks are exactly what's needed. Rephrase
+        # the question actually sent to the answer prompt so it reads as a
+        # real request for a recommendation from the context.
+        question_for_answer = question
+        if detected_intent:
+            question_for_answer = (
+                f"{question} — Based on the context, recommend suitable option(s) "
+                f"that address this (the person is looking for something related to "
+                f"'{detected_intent}')."
+            )
+
+        # Retrieve relevant documents using the (possibly condensed +
+        # intent-expanded) question
         results = self.retriever.retrieve(
-            search_question,
+            search_question_for_retrieval,
             top_k=top_k,
             score_threshold=min_score,
             metadata_filter=metadata_filter or None,
@@ -880,6 +1041,7 @@ Rules:
 - Use ONLY the information in the context to answer. Do NOT use outside knowledge, even if you know the answer.
 - Do NOT guess, infer, or add details that are not explicitly present in the context.
 - You may use the conversation history to understand what the user is referring to (e.g. pronouns like "it" or "there"), but never pull facts from the history itself — only from the context.
+- The question may express a mood or need (e.g. "I'm hungry", "I'm bored") rather than a literal question. In that case, treat it as a request for recommendations and suggest the most relevant option(s) from the context, explaining briefly why each fits.
 - If the context does not contain enough information to answer, respond exactly with:
   "I don't have information about this in the provided documents."
 - Keep the answer concise and grounded strictly in the context.
@@ -887,7 +1049,7 @@ Rules:
 {history_block}Context:
 {context}
 
-Question: {question}
+Question: {question_for_answer}
 
 Answer:"""
 
@@ -934,6 +1096,7 @@ Answer:"""
             'session_id': session_id,
             'history': self.history,
             'location_inferred_taluka': location_inferred_taluka,
+            'detected_intent': detected_intent,
         }
 
 
@@ -1470,6 +1633,27 @@ def location_taluka(lat: float, lng: float):
     if taluka is None:
         return {"lat": lat, "lng": lng, "taluka": None, "message": "Location too far from Goa to infer a taluka"}
     return {"lat": lat, "lng": lng, "taluka": taluka}
+
+
+@app.get("/intent/detect")
+def intent_detect(text: str):
+    """
+    Standalone intent-detection debug endpoint, mirroring /location/taluka.
+    Lets you test phrases like "im so bored" or "starving rn" against
+    INTENT_PATTERNS without going through a full /query call, and shows
+    whether a real ingested category could be resolved for that intent.
+    """
+    intent = detect_intent(text)
+    if intent is None:
+        return {"text": text, "intent": None, "message": "No intent matched"}
+
+    resolved = resolve_intent_category(intent)
+    return {
+        "text": text,
+        "intent": intent,
+        "query_expansion": INTENT_QUERY_EXPANSION.get(intent),
+        "resolved_filter": {resolved[0]: resolved[1]} if resolved else None,
+    }
 
 
 @app.post("/sessions")
