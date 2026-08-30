@@ -419,10 +419,13 @@ INTENT_PATTERNS: Dict[str, List[str]] = {
     "bored": [
         r"\bbored\b", r"\bboring\b", r"\bnothing to do\b", r"\bkilling time\b",
         r"\bwhat (?:can|should) i do\b", r"\bany(?:thing)? (?:fun )?to do\b",
+        r"\bsomething to do\b", r"\bfeel like doing\b",
     ],
     "fun": [
         r"\bwant(?:ed)? to have (?:some )?fun\b", r"\bhave (?:some )?fun\b",
         r"\blooking for fun\b", r"\bexciting\b", r"\badventure\b", r"\bthrill\b", r"\bparty\b",
+        r"\bsomething fun\b", r"\bdo something fun\b", r"\bwant(?:ed)? to do (?:something )?fun\b",
+        r"\bfun (?:stuff|things|activity|activities)\b", r"\bfun (?:place|places) to go\b",
     ],
     "relax": [
         r"\btired\b", r"\bstressed\b", r"\bneed to relax\b", r"\bwant to (?:relax|unwind|chill)\b",
@@ -479,11 +482,11 @@ INTENT_CATEGORY_HINTS: Dict[str, List[str]] = {
 }
 
 
-def detect_intent(text: str) -> Optional[str]:
+def detect_intent_keyword(text: str) -> Optional[str]:
     """
-    Match free text against INTENT_PATTERNS and return the first matching
-    intent key ("hungry", "bored", "fun", ...), or None if nothing matches.
-    Dict-definition order acts as priority if two intents could both match.
+    Regex/keyword fallback intent detector. Kept as a safety net for
+    llm_detect_intent (below) in case the LLM call or JSON parse fails —
+    retrieval on a raw follow-up is still better than erroring out.
     """
     lowered = text.lower()
     for intent, patterns in INTENT_PATTERNS.items():
@@ -519,6 +522,121 @@ def resolve_intent_category(intent: str) -> Optional[tuple]:
                 if hint in val or val in hint:
                     return field, val
     return None
+
+
+def _get_categorical_field_summary(max_fields: int = 5, max_values_per_field: int = 30) -> str:
+    """
+    Build a short "field: value, value, ..." text block summarizing the
+    categorical fields actually seen during ingestion (FIELD_VALUE_REGISTRY),
+    for use in the LLM intent-classification prompt below. Keeps the prompt
+    short and grounded in real data instead of a hardcoded category list.
+    """
+    lines = []
+    candidate_fields = [f for f in ("category", "type", "sub_category") if f in FIELD_VALUE_REGISTRY]
+    fields = candidate_fields or list(FIELD_VALUE_REGISTRY.keys())
+    for field in fields[:max_fields]:
+        values = sorted(FIELD_VALUE_REGISTRY.get(field, set()))[:max_values_per_field]
+        if values:
+            lines.append(f"{field}: {', '.join(values)}")
+    return "\n".join(lines)
+
+
+def llm_detect_intent(question: str) -> Dict[str, Optional[str]]:
+    """
+    Use the LLM itself to interpret whether a message expresses a mood or
+    need ("I'm hungry", "so bored", "want to do something fun") rather than
+    relying on a fixed regex list. This generalizes far better than
+    INTENT_PATTERNS — it isn't limited to phrasing anyone thought to write
+    a pattern for.
+
+    The LLM is grounded in the categorical fields/values actually seen
+    during ingestion (see _get_categorical_field_summary), and any
+    filter_field/filter_value it proposes is verified against
+    FIELD_VALUE_REGISTRY before being trusted — the LLM can suggest a
+    filter, but it can't invent one the dataset doesn't actually have.
+
+    Falls back to the regex-based detect_intent_keyword (+ its matching
+    INTENT_QUERY_EXPANSION / resolve_intent_category) if the LLM call or
+    JSON parsing fails for any reason, same defensive pattern as
+    AdvancedRAGPipeline._condense_followup.
+
+    Returns a dict:
+        {"intent": str|None, "search_expansion": str|None,
+         "filter_field": str|None, "filter_value": str|None}
+    """
+    field_summary = _get_categorical_field_summary()
+    fields_block = (
+        f"Known categories from the ingested dataset:\n{field_summary}\n\n"
+        if field_summary else ""
+    )
+
+    prompt = f"""You are an intent-classification step in a travel recommendation search system.
+
+The traveler's message may express a mood or need ("I'm hungry", "so bored", "want to do something fun", "feeling stressed") rather than being a literal, direct question. Your job:
+
+1. Decide if the message expresses such a mood/need. If yes, give it a short one-or-two-word label (e.g. hungry, bored, fun, relax, romantic, nightlife, shopping, nature, family). If it's already a direct, literal question about specific facts, respond with "none".
+2. Give a short search phrase (3-8 words) describing what kind of place or activity would satisfy this need. This is used only to improve search matching, not shown to the user.
+3. {fields_block}If one of the known category values above is a strong match for this need, name the EXACT field and EXACT value as they appear above. Otherwise use "none" for both.
+
+Respond with ONLY compact JSON in this exact shape, no explanation, no markdown fences:
+{{"intent": "<label or none>", "search_expansion": "<phrase or none>", "filter_field": "<field name or none>", "filter_value": "<value or none>"}}
+
+Traveler message: "{question}"
+
+JSON:"""
+
+    fallback_empty = {"intent": None, "search_expansion": None, "filter_field": None, "filter_value": None}
+
+    try:
+        raw = (cached_llm_invoke(prompt) or "").strip()
+        # Small models sometimes wrap JSON in markdown fences anyway.
+        raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.MULTILINE).strip()
+        match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+        if not match:
+            raise ValueError(f"No JSON object found in LLM intent response: {raw!r}")
+        parsed = json.loads(match.group(0))
+
+        def _clean(value: Any) -> Optional[str]:
+            if not isinstance(value, str):
+                return None
+            value = value.strip()
+            return None if value.lower() in ("", "none", "null") else value
+
+        intent = _clean(parsed.get("intent"))
+        search_expansion = _clean(parsed.get("search_expansion"))
+        filter_field = _clean(parsed.get("filter_field"))
+        filter_value = _clean(parsed.get("filter_value"))
+
+        # Never trust the LLM's filter suggestion blindly — only apply it
+        # if it matches a value that was actually registered at ingestion.
+        if filter_field and filter_value:
+            registered_values = FIELD_VALUE_REGISTRY.get(filter_field.strip().lower(), set())
+            if filter_value.strip().lower() in registered_values:
+                filter_field, filter_value = filter_field.strip().lower(), filter_value.strip().lower()
+            else:
+                filter_field, filter_value = None, None
+        else:
+            filter_field, filter_value = None, None
+
+        return {
+            "intent": intent,
+            "search_expansion": search_expansion,
+            "filter_field": filter_field,
+            "filter_value": filter_value,
+        }
+
+    except Exception as e:
+        print(f"LLM intent detection failed, falling back to keyword matcher: {e}")
+        keyword_intent = detect_intent_keyword(question)
+        if not keyword_intent:
+            return fallback_empty
+        resolved = resolve_intent_category(keyword_intent)
+        return {
+            "intent": keyword_intent,
+            "search_expansion": INTENT_QUERY_EXPANSION.get(keyword_intent),
+            "filter_field": resolved[0] if resolved else None,
+            "filter_value": resolved[1] if resolved else None,
+        }
 
 
 # ==========================================================
@@ -960,21 +1078,23 @@ Standalone question:"""
                 )
 
         # INTENT: catch moods/needs ("im hungry", "so bored", "want to have
-        # fun") that don't name a place/category directly. Expands the
-        # *retrieval* query with related terms, and adds a category filter
-        # only if the ingested dataset actually has a matching value.
-        detected_intent = detect_intent(search_question)
+        # fun") that don't name a place/category directly. The LLM itself
+        # classifies intent (llm_detect_intent) — far more general than a
+        # fixed regex list — and any category filter it proposes is
+        # verified against what was actually ingested before being trusted.
+        intent_result = llm_detect_intent(search_question)
+        detected_intent = intent_result["intent"]
         search_question_for_retrieval = search_question
         if detected_intent:
-            expansion = INTENT_QUERY_EXPANSION.get(detected_intent, "")
-            if expansion:
-                search_question_for_retrieval = f"{search_question} {expansion}"
+            if intent_result["search_expansion"]:
+                search_question_for_retrieval = f"{search_question} {intent_result['search_expansion']}"
 
-            resolved_category = resolve_intent_category(detected_intent)
-            if resolved_category:
-                field, value = resolved_category
-                metadata_filter.setdefault(field, value)
-                print(f"Intent '{detected_intent}' resolved to filter {field}={value}")
+            if intent_result["filter_field"] and intent_result["filter_value"]:
+                metadata_filter.setdefault(intent_result["filter_field"], intent_result["filter_value"])
+                print(
+                    f"Intent '{detected_intent}' resolved to filter "
+                    f"{intent_result['filter_field']}={intent_result['filter_value']}"
+                )
             else:
                 print(f"Intent '{detected_intent}' detected but no matching ingested category — expanding query only")
 
@@ -1639,20 +1759,19 @@ def location_taluka(lat: float, lng: float):
 def intent_detect(text: str):
     """
     Standalone intent-detection debug endpoint, mirroring /location/taluka.
-    Lets you test phrases like "im so bored" or "starving rn" against
-    INTENT_PATTERNS without going through a full /query call, and shows
-    whether a real ingested category could be resolved for that intent.
+    Lets you test phrases like "im so bored" or "starving rn" against the
+    LLM-based classifier (llm_detect_intent) without going through a full
+    /query call, and shows whether a real ingested category was resolved.
     """
-    intent = detect_intent(text)
-    if intent is None:
-        return {"text": text, "intent": None, "message": "No intent matched"}
-
-    resolved = resolve_intent_category(intent)
+    result = llm_detect_intent(text)
     return {
         "text": text,
-        "intent": intent,
-        "query_expansion": INTENT_QUERY_EXPANSION.get(intent),
-        "resolved_filter": {resolved[0]: resolved[1]} if resolved else None,
+        "intent": result["intent"],
+        "search_expansion": result["search_expansion"],
+        "resolved_filter": (
+            {result["filter_field"]: result["filter_value"]}
+            if result["filter_field"] and result["filter_value"] else None
+        ),
     }
 
 
